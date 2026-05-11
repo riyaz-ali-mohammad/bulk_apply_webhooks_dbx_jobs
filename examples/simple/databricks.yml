@@ -1,5 +1,5 @@
 bundle:
-  name: riz-webhook-test-bundle
+  name: webhook-test-bundle
 
 targets:
   dev:
@@ -8,10 +8,10 @@ targets:
 
 resources:
   jobs:
-    riz_bundle_webhook_test:
-      name: riz-bundle-webhook-test
+    webhook_test_job:
+      name: webhook-test-job
       tags:
-        webhook-test: riz-bundle
+        webhook-test: simple
       webhook_notifications:
         on_failure:
           - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c

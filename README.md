@@ -335,33 +335,38 @@ Inspect the log for `update failed:` lines. Most commonly: rate-limit exhaustion
 
 ---
 
-## Test bundle (reference)
+## Example bundles (reference)
 
-The `test_bundle/` directory in this repo is a minimal Asset Bundle used to validate both scripts end-to-end. Full smoke-test workflow:
+The `examples/` directory contains two reference Asset Bundles you can use to validate both scripts end-to-end:
+
+- **`examples/simple/`** — single-job bundle, single target. Good for the smoke-test workflow below.
+- **`examples/complex/`** — multi-file bundle exercising variables, `include:` globs, YAML anchors/aliases, per-target overrides, and a mix of job and pipeline resources. Useful for stress-testing the patcher.
+
+Full smoke-test workflow against the simple bundle:
 
 ```bash
-# 1. Deploy the test bundle
-cd test_bundle
+# 1. Deploy the example bundle
+cd examples/simple
 databricks bundle validate
 databricks bundle deploy
-cd ..
+cd ../..
 
 # 2. Confirm the bulk script detects the deployed job as bundle-managed.
 #    Look for bundle_total=1 in the summary and inspect bundle_jobs.csv.
 python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID" \
-    --tag webhook-test=riz-bundle --bundle-jobs only
+    --tag webhook-test=simple --bundle-jobs only
 
 # 3. Confirm the default skip behavior leaves bundle jobs untouched even
 #    with --apply. Look for `SKIP bundle-managed` and updated=0.
 python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID" \
-    --tag webhook-test=riz-bundle --apply
+    --tag webhook-test=simple --apply
 
 # 4. Patch the YAML via the companion script (dry-run first).
-python3 patch_bundle_yaml.py --bundle-dir test_bundle --webhook-id "$WEBHOOK_ID"
-python3 patch_bundle_yaml.py --bundle-dir test_bundle --webhook-id "$WEBHOOK_ID" --apply
+python3 patch_bundle_yaml.py --bundle-dir examples/simple --webhook-id "$WEBHOOK_ID"
+python3 patch_bundle_yaml.py --bundle-dir examples/simple --webhook-id "$WEBHOOK_ID" --apply
 
 # 5. Redeploy and verify the webhook is now attached durably.
-cd test_bundle && databricks bundle deploy && cd ..
+cd examples/simple && databricks bundle deploy && cd ../..
 
 # 6. From the workspace UI, Run now on the test job and confirm the POST
 #    arrives at your webhook capture endpoint.
