@@ -21,11 +21,7 @@ import sys
 from urllib.parse import urlparse
 
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.settings import (
-    Config,
-    DestinationType,
-    GenericWebhookConfig,
-)
+from databricks.sdk.service.settings import Config, GenericWebhookConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,7 +83,6 @@ def main() -> int:
 
     dest = w.notification_destinations.create(
         display_name=args.name,
-        destination_type=DestinationType.WEBHOOK,
         config=Config(generic_webhook=GenericWebhookConfig(url=args.url)),
     )
     print_summary("Created:", dest)
