@@ -1,11 +1,12 @@
 # Bulk Apply Webhook Notifications to Databricks Jobs
 
-Two Python scripts for rolling out a webhook-based Notification Destination across every job in a Databricks workspace:
+Three Python scripts for rolling out a webhook-based Notification Destination across every job in a Databricks workspace:
 
-1. **`bulk_apply_webhooks.py`** — workspace-side script. Walks every job via the Jobs API, attaches the webhook to manually-created jobs, and inventories bundle-managed jobs for hand-off (because API edits to bundle jobs are non-durable).
-2. **`patch_bundle_yaml.py`** — companion script. Runs on a local checkout of a bundle repo, edits the bundle YAML in place to add `webhook_notifications` to job resources, producing a review-ready git diff. This is the durable fix for bundle-managed jobs.
+1. **`create_webhook_destination.py`** — one-shot setup. Creates a generic-webhook Notification Destination from a URL, so you can skip the Admin Settings UI. Idempotent on display name.
+2. **`bulk_apply_webhooks.py`** — workspace-side script. Walks every job via the Jobs API, attaches the webhook to manually-created jobs, and inventories bundle-managed jobs for hand-off (because API edits to bundle jobs are non-durable).
+3. **`patch_bundle_yaml.py`** — companion script. Runs on a local checkout of a bundle repo, edits the bundle YAML in place to add `webhook_notifications` to job resources, producing a review-ready git diff. This is the durable fix for bundle-managed jobs.
 
-Both scripts default to dry-run, support tag/owner filters for staged rollout, and are idempotent.
+All three scripts default to dry-run and are idempotent. The bulk and patch scripts also support tag/owner filters for staged rollout.
 
 ---
 
@@ -72,17 +73,28 @@ databricks current-user me
 
 ---
 
-## Find your webhook destination ID
+## Get a webhook destination ID
 
-The script takes a destination **ID**, not a URL. Create the destination once in Admin Settings → Notifications, then look up its ID:
+The bulk script takes a destination **ID**, not a URL. You have two options:
 
+**Option A — create one programmatically (`create_webhook_destination.py`).** Useful when the receiving URL is already known and you want a scriptable, idempotent setup:
+```bash
+# Dry-run first
+python3 create_webhook_destination.py --url https://hooks.example.com/abc --name my-team-webhook
+
+# Actually create (idempotent: re-running with the same --name returns the existing ID)
+python3 create_webhook_destination.py --url https://hooks.example.com/abc --name my-team-webhook --apply
+```
+The script prints the ID, display name, and URL on success. Re-running with a `--name` that already exists is a no-op — it reports the existing destination without mutating anything.
+
+**Option B — create one manually in Admin Settings → Notifications**, then look up its ID:
 ```bash
 # By display name, returning just the ID:
 databricks notification-destinations list -o json \
   | jq -r '(.results // .) | .[] | select(.display_name=="<your-destination-name>") | .id'
 ```
 
-Stash it in a variable for the rest of the session:
+Either way, stash it in a variable for the rest of the session:
 ```bash
 WEBHOOK_ID=$(databricks notification-destinations list -o json \
   | jq -r '(.results // .) | .[] | select(.display_name=="<your-destination-name>") | .id')
