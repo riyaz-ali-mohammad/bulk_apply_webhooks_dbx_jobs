@@ -1,0 +1,25 @@
+bundle:
+  name: riz-webhook-test-bundle
+
+targets:
+  dev:
+    mode: development
+    default: true
+
+resources:
+  jobs:
+    riz_bundle_webhook_test:
+      name: riz-bundle-webhook-test
+      tags:
+        webhook-test: riz-bundle
+      webhook_notifications:
+        on_failure:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+        on_success:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+        on_start:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+      tasks:
+        - task_key: fail_me
+          notebook_task:
+            notebook_path: ./notebooks/fail_me.py

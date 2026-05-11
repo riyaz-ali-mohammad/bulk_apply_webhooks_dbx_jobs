@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+
+# Claude Code workspace state
+.claude/
+
+# Databricks bundle deployment state (terraform, sync snapshots, binaries)
+.databricks/

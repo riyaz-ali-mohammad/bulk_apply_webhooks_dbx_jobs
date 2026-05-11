@@ -1,0 +1,2 @@
+job_id,name,creator,bundle_name,target,git_origin,git_branch,git_commit,workspace_root,workspace_file_path,metadata_file_path
+28210245806223,[dev riyazali_mohammad] riz-bundle-webhook-test,riyazali.mohammad@databricks.com,riz-webhook-test-bundle,dev,,,,,/Workspace/Users/riyazali.mohammad@databricks.com/.bundle/riz-webhook-test-bundle/dev/files,/Workspace/Users/riyazali.mohammad@databricks.com/.bundle/riz-webhook-test-bundle/dev/state/metadata.json
