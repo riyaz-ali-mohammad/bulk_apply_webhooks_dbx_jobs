@@ -57,6 +57,17 @@ def parse_args() -> argparse.Namespace:
         help="Limit to jobs whose `name:` field matches. Repeatable.",
     )
     p.add_argument("--tag", help="Filter by job-resource tag. Format: key=value, or just key.")
+    p.add_argument(
+        "--skip-target-overrides",
+        action="store_true",
+        help=(
+            "Skip per-target override blocks (`targets.<env>.resources.jobs.<name>`). "
+            "Patches only base job definitions and relies on bundle deep-merge to "
+            "propagate webhook config into targets. Produces tighter diffs, but the "
+            "override may still need manual patching if it defines its own "
+            "`webhook_notifications` block."
+        ),
+    )
     p.add_argument("--apply", action="store_true", help="Write files in place. Default: dry-run diff to stdout.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
@@ -199,6 +210,7 @@ def main() -> int:
     total_jobs_seen = 0
     total_jobs_matched = 0
     total_jobs_patched = 0
+    total_overrides_skipped = 0
 
     for path in files:
         with path.open() as f:
@@ -210,6 +222,19 @@ def main() -> int:
         file_changed = False
         for loc, jnode in find_job_nodes(doc):
             total_jobs_seen += 1
+            if args.skip_target_overrides and loc.startswith("targets."):
+                total_overrides_skipped += 1
+                # Warn loudly if the override already has its own webhook block,
+                # because bundle deep-merge will let it win over the base's.
+                has_own_webhooks = isinstance(jnode.get("webhook_notifications"), dict)
+                level = logging.WARNING if has_own_webhooks else logging.INFO
+                logging.log(
+                    level,
+                    "  %s :: %s -> skipped (target override%s)",
+                    path.relative_to(bundle_dir), loc,
+                    "; has own webhook_notifications, may need manual patch" if has_own_webhooks else "",
+                )
+                continue
             if not job_matches(jnode, args.job, tag):
                 continue
             total_jobs_matched += 1
@@ -237,9 +262,9 @@ def main() -> int:
             ))
 
     logging.info(
-        "Done. mode=%s files_changed=%d jobs_seen=%d jobs_matched=%d jobs_patched=%d",
+        "Done. mode=%s files_changed=%d jobs_seen=%d jobs_matched=%d jobs_patched=%d overrides_skipped=%d",
         "APPLY" if args.apply else "DRY-RUN",
-        total_files_changed, total_jobs_seen, total_jobs_matched, total_jobs_patched,
+        total_files_changed, total_jobs_seen, total_jobs_matched, total_jobs_patched, total_overrides_skipped,
     )
     return 0
 

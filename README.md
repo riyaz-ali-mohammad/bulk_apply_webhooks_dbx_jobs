@@ -224,6 +224,9 @@ The owning team reviews the PR; their CI runs `databricks bundle deploy` on merg
                           bulk script.
 --job <name>              Limit to jobs whose `name:` field matches. Repeatable.
 --tag key=value | key     Filter by the job's YAML `tags:` block.
+--skip-target-overrides   Skip `targets.<env>.resources.jobs.<name>` blocks.
+                          Tighter diffs; relies on bundle deep-merge to push
+                          the webhook config into each target.
 --apply                   Write files in place. Default: dry-run diff to stdout.
 -v, --verbose             DEBUG-level logging (logs "already has webhook" hits).
 ```
@@ -233,7 +236,7 @@ The owning team reviews the PR; their CI runs `databricks bundle deploy` on merg
 - **Templated webhook IDs**: bundles using `${var.webhook_id}` should add the variable definition manually instead of using this script. The script writes literal IDs.
 - **Anchors and `<<:` merges**: ruamel preserves anchors on round-trip, but if jobs share configuration via `<<: *base`, you may want to put the webhook block on the base anchor rather than each job. Review the diff carefully on those repos.
 - **No `bundle validate` built in**: run `databricks bundle validate` after `--apply` and before opening the PR — it'll catch any structural issue (rare, but cheap insurance).
-- **Per-target overrides**: if a job is redefined inside `targets.<env>.resources.jobs.<name>`, the script patches both the top-level definition and the override. This is usually what you want (consistent behavior across envs). If you need env-specific webhook config, edit the YAML by hand.
+- **Per-target overrides**: by default, the script patches both base job definitions and per-target overrides (`targets.<env>.resources.jobs.<name>`). This is explicit but produces extra diff lines. Pass `--skip-target-overrides` to patch only base definitions and rely on bundle deep-merge to propagate webhook config into each target. When that flag is set, the script logs a WARNING for any override that already has its own `webhook_notifications` block — bundle merge would let the override's list win over the base, so those need a manual patch.
 
 ---
 

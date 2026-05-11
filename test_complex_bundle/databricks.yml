@@ -1,0 +1,34 @@
+# Complex test bundle for patch_bundle_yaml.py.
+# Exercises: variables, multi-file includes, YAML anchors/aliases,
+# per-target overrides, and mixed resource types (jobs + pipelines).
+bundle:
+  name: complex-webhook-test-bundle
+
+variables:
+  default_cluster_node:
+    description: Node type for ephemeral clusters across all jobs.
+    default: i3.xlarge
+  webhook_id:
+    description: |
+      Notification destination ID. The patch script writes literal IDs,
+      not ${var.webhook_id} references. Refactor by hand if your team
+      prefers indirection.
+    default: "00000000-0000-0000-0000-000000000000"
+
+include:
+  - resources/*.yml
+  - resources/jobs/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+
+  prod:
+    mode: production
+    resources:
+      jobs:
+        # Per-target override: rename analytics in prod and bump timeout.
+        analytics_job:
+          name: analytics-prod
+          timeout_seconds: 7200

@@ -1,0 +1,24 @@
+# Analytics job — already partially wired with webhook_notifications.
+# Useful for verifying the patcher's merge semantics: preserves existing
+# webhook ids (including variable references) and appends ours.
+resources:
+  jobs:
+    analytics_job:
+      name: analytics
+      tags:
+        team: analytics
+      webhook_notifications:
+        on_failure:
+          # Existing dedicated alert channel; must survive the merge.
+          - id: "11111111-2222-3333-4444-555555555555"
+          # Variable reference is treated as an opaque string by the patcher.
+          - id: ${var.webhook_id}
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+        on_success:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+        on_start:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+      tasks:
+        - task_key: run_report
+          notebook_task:
+            notebook_path: ../../notebooks/common.py

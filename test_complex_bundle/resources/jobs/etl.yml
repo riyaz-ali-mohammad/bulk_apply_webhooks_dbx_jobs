@@ -1,0 +1,43 @@
+# ETL job resources. Demonstrates shared tag conventions via YAML anchor/alias.
+resources:
+  jobs:
+    nightly_etl:
+      name: nightly-etl
+      tags: &etl_tags
+        team: data-platform
+        cohort: webhook-rollout-1
+      webhook_notifications:
+        on_failure:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+        on_success:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+        on_start:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+      tasks:
+        - task_key: extract
+          notebook_task:
+            notebook_path: ../../notebooks/common.py
+        - task_key: transform
+          depends_on:
+            - task_key: extract
+          notebook_task:
+            notebook_path: ../../notebooks/common.py
+
+    hourly_etl:
+      name: hourly-etl
+      # Reuse the etl_tags anchor — patcher must preserve the alias on round-trip.
+      tags: *etl_tags
+      schedule:
+        quartz_cron_expression: "0 0 * * * ?"
+        timezone_id: UTC
+      webhook_notifications:
+        on_failure:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+        on_success:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+        on_start:
+          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+      tasks:
+        - task_key: incremental
+          notebook_task:
+            notebook_path: ../../notebooks/common.py
