@@ -356,7 +356,138 @@ The owning team reviews the PR; their CI runs `databricks bundle deploy` on merg
 - **Templated webhook IDs**: bundles using `${var.webhook_id}` should add the variable definition manually instead of using this script. The script writes literal IDs.
 - **Anchors and `<<:` merges**: ruamel preserves anchors on round-trip, but if jobs share configuration via `<<: *base`, you may want to put the webhook block on the base anchor rather than each job. Review the diff carefully on those repos.
 - **No `bundle validate` built in**: run `databricks bundle validate` after `--apply` and before opening the PR — it'll catch any structural issue (rare, but cheap insurance).
-- **Per-target overrides**: by default, the script patches both base job definitions and per-target overrides (`targets.<env>.resources.jobs.<name>`). This is explicit but produces extra diff lines. Pass `--skip-target-overrides` to patch only base definitions and rely on bundle deep-merge to propagate webhook config into each target. When that flag is set, the script logs a WARNING for any override that already has its own `webhook_notifications` block — bundle merge would let the override's list win over the base, so those need a manual patch.
+- **Per-target overrides**: by default, the script patches both base job definitions and per-target overrides (`targets.<env>.resources.jobs.<name>`). This is explicit but produces extra diff lines. Pass `--skip-target-overrides` to patch only base definitions and rely on bundle deep-merge to propagate webhook config into each target. When that flag is set, the script logs a WARNING for any override that already has its own `webhook_notifications` block — bundle merge would let the override's list win over the base, so those need a manual patch. See the worked example below for what each of the three cases produces.
+
+### Per-target overrides: worked example
+
+Using the `examples/complex/` bundle in this repo as a starting point — it has an `analytics_job` defined in the base and partially overridden in the `prod` target:
+
+```yaml
+# examples/complex/resources/jobs/analytics.yml  (base)
+resources:
+  jobs:
+    analytics_job:
+      name: analytics
+      tags:
+        team: analytics
+      tasks:
+        - task_key: run_report
+          notebook_task:
+            notebook_path: ../../notebooks/common.py
+
+# examples/complex/databricks.yml  (per-target override)
+targets:
+  prod:
+    mode: production
+    resources:
+      jobs:
+        analytics_job:
+          name: analytics-prod
+          timeout_seconds: 7200
+```
+
+The override touches only `name` and `timeout_seconds`. No `webhook_notifications` of its own.
+
+#### Case 1 — default behavior: patch base AND override
+
+```bash
+python3 patch_bundle_yaml.py --bundle-dir examples/complex --webhook-id WID --apply
+```
+
+Both blocks get the same `webhook_notifications` written into them:
+
+```yaml
+# resources/jobs/analytics.yml — base, patched
+analytics_job:
+  name: analytics
+  tags:
+    team: analytics
+  webhook_notifications:        # <-- added
+    on_failure:
+      - id: WID
+    on_success:
+      - id: WID
+    on_start:
+      - id: WID
+  tasks: [...]
+
+# databricks.yml — override ALSO patched
+targets:
+  prod:
+    resources:
+      jobs:
+        analytics_job:
+          name: analytics-prod
+          webhook_notifications:    # <-- redundantly added
+            on_failure:
+              - id: WID
+            on_success:
+              - id: WID
+            on_start:
+              - id: WID
+          timeout_seconds: 7200
+```
+
+The override patch is redundant — at deploy time, bundle deep-merge would already have propagated the base's `webhook_notifications` into prod. But the diff is explicit, which some reviewers prefer.
+
+#### Case 2 — `--skip-target-overrides`, override has no own webhook block (INFO log)
+
+```bash
+python3 patch_bundle_yaml.py --bundle-dir examples/complex --webhook-id WID --skip-target-overrides --apply
+```
+
+```
+INFO  databricks.yml :: targets.prod.resources.jobs.analytics_job -> skipped (target override)
+```
+
+Only the base file is patched. `databricks.yml` is untouched. At deploy time, bundle deep-merge combines base + override → prod ends up with `name: analytics-prod`, `timeout_seconds: 7200`, **and** `webhook_notifications: {...}` from the base. Same operational result as Case 1, half the diff lines. This is the happy path for `--skip-target-overrides`.
+
+#### Case 3 — `--skip-target-overrides`, override HAS its own webhook block (WARNING log)
+
+Imagine prod already wired up a different destination (e.g. a PagerDuty-only one):
+
+```yaml
+# databricks.yml — override has its own webhook_notifications
+targets:
+  prod:
+    resources:
+      jobs:
+        analytics_job:
+          name: analytics-prod
+          webhook_notifications:
+            on_failure:
+              - id: prod-pagerduty-destination-uuid
+          timeout_seconds: 7200
+```
+
+Running with `--skip-target-overrides`:
+
+```
+WARNING  databricks.yml :: targets.prod.resources.jobs.analytics_job -> skipped (target override; has own webhook_notifications, may need manual patch)
+```
+
+What actually ships:
+
+- Base gets the new `WID` webhook patched in.
+- prod's override is untouched.
+- **Bundle deep-merge replaces lists, doesn't concatenate them.** So in prod, the override's `webhook_notifications: { on_failure: [pagerduty-uuid] }` wins entirely — the base's `WID` never reaches prod. Prod is silently missing the rollout.
+
+Fix by hand-editing `databricks.yml` to add `WID` into prod's existing event lists:
+
+```yaml
+webhook_notifications:
+  on_failure:
+    - id: prod-pagerduty-destination-uuid
+    - id: WID            # <-- add by hand so prod gets both
+  on_success:
+    - id: WID            # <-- on_success/on_start didn't exist before; add
+  on_start:
+    - id: WID
+```
+
+Or, if you don't want the WARNING-then-manual-edit dance, drop `--skip-target-overrides` and let the patcher write through (Case 1). That always wins because the override's `webhook_notifications` gets fully rewritten.
+
+**Tl;dr:** `--skip-target-overrides` is great when overrides only customize unrelated fields (name, timeout, tags). It's a footgun when an override defines its own `webhook_notifications`, because DAB list-merge semantics are "override replaces base." The WARNING is your only signal.
 
 ---
 
