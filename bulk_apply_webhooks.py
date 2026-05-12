@@ -16,6 +16,12 @@ Examples:
   # Staged rollout: cap to 25 owner-filtered jobs, then re-run for the rest
   python bulk_apply_webhooks.py --webhook-id 0123abcd \
       --owner alice@example.com --owner bob@example.com --limit 25 --apply
+
+  # Remove all webhooks from specific jobs
+  python bulk_apply_webhooks.py --remove --job-id 1234 --job-id 5678 --apply
+
+  # Remove only one destination from specific jobs (others survive)
+  python bulk_apply_webhooks.py --remove --job-id 1234 --webhook-id 0123abcd --apply
 """
 
 import argparse
@@ -86,11 +92,35 @@ class BundleJobRecord:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--webhook-id", required=True, help="Notification destination (webhook) ID to attach.")
+    p.add_argument(
+        "--webhook-id",
+        help=(
+            "Notification destination (webhook) ID. Required in add mode. "
+            "Optional in --remove mode: when given, only that destination is removed; "
+            "when omitted, ALL webhook_notifications are cleared from the targeted jobs."
+        ),
+    )
+    p.add_argument(
+        "--remove",
+        action="store_true",
+        help=(
+            "Remove mode: detach webhook(s) from explicit --job-id(s) instead of bulk-attaching. "
+            "Pair with --webhook-id to remove a specific destination, or omit --webhook-id to "
+            "clear all webhook_notifications. Bundle-managed jobs proceed with a WARNING since "
+            "API removal is non-durable across `bundle deploy`."
+        ),
+    )
+    p.add_argument(
+        "--job-id",
+        action="append",
+        default=[],
+        type=int,
+        help="Job ID to operate on. Required with --remove. Repeatable.",
+    )
     p.add_argument(
         "--events",
         default="on_failure,on_success,on_start",
-        help=f"Comma-separated event list. Valid: {', '.join(EVENT_FIELDS)}.",
+        help=f"Comma-separated event list (add mode only). Valid: {', '.join(EVENT_FIELDS)}.",
     )
     p.add_argument("--tag", help="Filter by job tag. Format: key=value, or just key for presence-only.")
     p.add_argument(
@@ -128,7 +158,16 @@ def parse_args() -> argparse.Namespace:
         help="Log a progress line every N jobs scanned. 0 disables.",
     )
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.remove:
+        if not args.job_id:
+            p.error("--remove requires at least one --job-id.")
+    else:
+        if not args.webhook_id:
+            p.error("--webhook-id is required (unless using --remove).")
+        if args.job_id:
+            p.error("--job-id is only valid with --remove. In add mode, use --tag/--owner filters.")
+    return args
 
 
 def setup_logging(verbose: bool) -> None:
@@ -277,6 +316,34 @@ def merge_webhooks(
     return WebhookNotifications(**kwargs)
 
 
+def remove_webhooks(
+    existing: Optional[WebhookNotifications],
+    webhook_id: Optional[str],
+) -> Tuple[WebhookNotifications, int]:
+    """Return (new_notifications, count_removed). If webhook_id is None, clears every event list;
+    otherwise removes only entries matching webhook_id. Events that end up empty are sent as []
+    so the API actually clears the list rather than treating absent == no-change."""
+    if not existing:
+        return WebhookNotifications(), 0
+    kwargs = {}
+    removed = 0
+    for ev in EVENT_FIELDS:
+        cur = list(getattr(existing, ev, None) or [])
+        if not cur:
+            continue
+        if webhook_id is None:
+            removed += len(cur)
+            kwargs[ev] = []
+        else:
+            kept = [wh for wh in cur if wh.id != webhook_id]
+            if len(kept) != len(cur):
+                removed += len(cur) - len(kept)
+                kwargs[ev] = kept
+            else:
+                kwargs[ev] = cur
+    return WebhookNotifications(**kwargs), removed
+
+
 def is_transient(err: Exception) -> bool:
     msg = str(err).upper()
     code = getattr(err, "error_code", "") or ""
@@ -343,15 +410,105 @@ def process_job(
         logging.error("Job %s (%s): update failed: %s", job.job_id, name, e)
 
 
+def process_remove_job(
+    w: WorkspaceClient,
+    job_id: int,
+    webhook_id: Optional[str],
+    apply: bool,
+    max_retries: int,
+    stats: Stats,
+) -> None:
+    try:
+        job = call_with_backoff(lambda: w.jobs.get(job_id=job_id), max_retries=max_retries)
+    except Exception as e:
+        stats.errored += 1
+        logging.error("Job %s: lookup failed: %s", job_id, e)
+        return
+
+    name = (job.settings.name if job.settings else None) or "<unnamed>"
+    stats.matched += 1
+
+    bundle, _ = is_bundle_job(job)
+    if bundle:
+        logging.warning(
+            "Job %s (%s): bundle-managed — API removal is non-durable; next `bundle deploy` "
+            "will re-add the webhook unless the bundle YAML is also patched.",
+            job_id, name,
+        )
+
+    existing = job.settings.webhook_notifications if job.settings else None
+    if not existing:
+        stats.already_attached += 1
+        logging.info("Job %s (%s): no webhook_notifications attached; nothing to remove.",
+                     job_id, name)
+        return
+
+    new_wh, count = remove_webhooks(existing, webhook_id)
+    if count == 0:
+        stats.already_attached += 1
+        logging.info("Job %s (%s): webhook %s not currently attached; no-op.",
+                     job_id, name, webhook_id)
+        return
+
+    logging.info(
+        "Job %s (%s): %s removing %d webhook entr%s (filter=%s)",
+        job_id, name,
+        "applying" if apply else "DRY-RUN would apply",
+        count, "y" if count == 1 else "ies",
+        webhook_id or "<all>",
+    )
+
+    if not apply:
+        stats.would_update += 1
+        return
+
+    try:
+        call_with_backoff(
+            lambda: w.jobs.update(
+                job_id=job_id,
+                new_settings=JobSettings(webhook_notifications=new_wh),
+            ),
+            max_retries=max_retries,
+        )
+        stats.updated += 1
+    except Exception as e:
+        stats.errored += 1
+        logging.error("Job %s (%s): remove failed: %s", job_id, name, e)
+
+
+def run_remove_mode(args: argparse.Namespace, w: WorkspaceClient, stats: Stats) -> int:
+    logging.info(
+        "Mode=%s op=REMOVE webhook_filter=%s jobs=%s",
+        "APPLY" if args.apply else "DRY-RUN",
+        args.webhook_id or "<all>",
+        args.job_id,
+    )
+    for job_id in args.job_id:
+        stats.scanned += 1
+        process_remove_job(w, job_id, args.webhook_id, args.apply, args.max_retries, stats)
+        if args.apply:
+            time.sleep(args.base_sleep + random.uniform(0, args.jitter))
+
+    logging.info(
+        "Done. op=REMOVE scanned=%d matched=%d nothing_to_remove=%d would_update=%d updated=%d errored=%d",
+        stats.scanned, stats.matched, stats.already_attached,
+        stats.would_update, stats.updated, stats.errored,
+    )
+    return 1 if stats.errored else 0
+
+
 def main() -> int:
     args = parse_args()
     setup_logging(args.verbose)
 
-    events = parse_events(args.events)
-    filters = parse_filters(args)
-
     w = build_client(args.profile)
     stats = Stats()
+
+    if args.remove:
+        return run_remove_mode(args, w, stats)
+
+    events = parse_events(args.events)
+    filters = parse_filters(args)
     bundle_records: List[BundleJobRecord] = []
     bundle_meta_cache: Dict[str, Optional[BundleMetadata]] = {}
 

@@ -22,11 +22,19 @@ All three scripts default to dry-run and are idempotent. The bulk and patch scri
 
 ## What `bulk_apply_webhooks.py` does
 
+**Add mode (default)**
+
 - Enumerates jobs via `GET /api/2.2/jobs/list` (paginated).
 - For each job, computes the desired `webhook_notifications` block by merging the supplied webhook ID into the configured event lists (defaults: `on_failure`, `on_success`, `on_start`). Existing webhooks are preserved.
 - Calls `POST /api/2.2/jobs/update` to apply the change.
 - Skips bundle-managed jobs by default (because `databricks bundle deploy` would overwrite API edits), and emits an inventory CSV of those jobs for hand-off to bundle owners.
 - Honors rate limits with exponential backoff plus jitter, and paces calls between updates.
+
+**Remove mode (`--remove`)**
+
+- Takes explicit `--job-id` arguments — no listing or filtering.
+- Removes either a specific webhook destination (when `--webhook-id` is given) or every webhook entry (when it isn't).
+- Same dry-run / `--apply` / backoff semantics. Logs a WARNING on bundle-managed jobs because the removal is non-durable across `bundle deploy`.
 
 ---
 
@@ -190,6 +198,37 @@ For workspaces with many jobs, do a staged rollout first — see the next sectio
 
 ---
 
+## Removing webhooks (`--remove`)
+
+If the rollout needs to be reversed — say the receiver is melting under load, or a destination was attached in error — use `--remove` mode. It takes explicit job IDs rather than walking the whole workspace, so it's surgical and fast.
+
+```bash
+# Remove ALL webhook_notifications from specific jobs
+python3 bulk_apply_webhooks.py --remove --job-id 1234 --job-id 5678 --apply
+
+# Remove only one destination, leaving any other subscriptions intact
+python3 bulk_apply_webhooks.py --remove --job-id 1234 --webhook-id "$WEBHOOK_ID" --apply
+
+# Dry-run first (default) — confirms what would be removed before mutating
+python3 bulk_apply_webhooks.py --remove --job-id 1234 --webhook-id "$WEBHOOK_ID"
+```
+
+**Semantics**
+
+- `--job-id` is required and repeatable; the script looks up each job directly (`jobs.get`), no full list pagination.
+- `--webhook-id` is **optional** in remove mode:
+  - Provided → only entries matching that destination ID are removed from every event list. Other webhooks on the same job survive.
+  - Omitted → every event list is cleared (`on_start`, `on_success`, `on_failure`, `on_duration_warning_threshold_exceeded`). Use with caution.
+- `--events` is ignored in remove mode — when a destination is removed, it's removed from every event it was subscribed to.
+- Re-running with the same arguments is a no-op (logs `not currently attached`).
+- Dry-run by default; pass `--apply` to write.
+
+**Bundle-managed jobs**
+
+`--remove` proceeds against bundle-managed jobs but logs a `WARNING`. The API change is non-durable: the next `databricks bundle deploy` will re-add whatever the bundle YAML specifies. To remove a webhook durably from a bundle job, either drop the corresponding `webhook_notifications` entry from the bundle YAML and redeploy, or temporarily empty the block in YAML. The bulk script can't do that — it only affects the live job settings.
+
+---
+
 ## Staged rollout with filters
 
 `--tag` and `--owner` are evaluated client-side after the list call. Combine them with `--limit` for safety on the first apply.
@@ -346,27 +385,35 @@ If the script couldn't read a bundle's metadata (e.g. ACL on the workspace path)
 ## CLI reference
 
 ```
---webhook-id <id>          Required. Notification destination ID to attach.
+--webhook-id <id>          Notification destination ID. Required in add mode.
+                           In --remove mode, optional: provide to remove only
+                           that destination; omit to clear ALL webhooks.
 --events on_failure,on_success,on_start
-                           Comma-separated event list. Valid values:
+                           Comma-separated event list (add mode only). Valid:
                            on_start, on_success, on_failure,
                            on_duration_warning_threshold_exceeded.
                            Default: on_failure,on_success,on_start.
 
+--remove                   Switch to remove mode. Pair with --job-id.
+--job-id <id>              Job ID to operate on (required with --remove).
+                           Repeatable. Invalid in add mode.
+
 --tag key=value | key      Filter to jobs whose tags contain key=value
-                           (or just key for presence-only).
---owner <email>            Filter by creator_user_name. Repeatable.
+                           (or just key for presence-only). Add mode only.
+--owner <email>            Filter by creator_user_name. Repeatable. Add mode only.
 
 --bundle-jobs {skip,include,only}
                            Policy for jobs with deployment.kind=BUNDLE.
-                           Default: skip.
+                           Default: skip. Add mode only — in --remove mode
+                           bundle jobs proceed with a WARNING.
 --bundle-report <path>     CSV output path. Default: bundle_jobs.csv.
                            Pass '' to disable.
 
 --apply                    Actually call jobs/update. Default is dry-run.
 --limit <N>                Stop after N updates (matched + would_update).
+                           Add mode only.
 --progress-every <N>       Log a tally every N scanned jobs. Default 500.
-                           Set 0 to disable.
+                           Set 0 to disable. Add mode only.
 
 --profile <name>           Databricks CLI profile to use.
 --max-retries <N>          Max retries on 429/5xx per call. Default 5.
