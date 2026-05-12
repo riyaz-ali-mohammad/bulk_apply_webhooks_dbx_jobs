@@ -168,13 +168,13 @@ Create the destination in **Admin Settings → Notifications**, then look up its
 ```bash
 # By display name, returning just the ID:
 databricks notification-destinations list -o json \
-  | jq -r '(.results // .) | .[] | select(.display_name=="<your-destination-name>") | .id'
+  | jq -r '(.results? // .)[] | select(.display_name=="<your-destination-name>") | .id'
 ```
 
 Either way, stash it in a variable for the rest of the session:
 ```bash
 WEBHOOK_ID=$(databricks notification-destinations list -o json \
-  | jq -r '(.results // .) | .[] | select(.display_name=="<your-destination-name>") | .id')
+  | jq -r '(.results? // .)[] | select(.display_name=="<your-destination-name>") | .id')
 ```
 
 ---
