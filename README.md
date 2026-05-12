@@ -354,9 +354,147 @@ The owning team reviews the PR; their CI runs `databricks bundle deploy` on merg
 ### Caveats worth flagging to bundle owners
 
 - **Templated webhook IDs**: bundles using `${var.webhook_id}` should add the variable definition manually instead of using this script. The script writes literal IDs.
-- **Anchors and `<<:` merges**: ruamel preserves anchors on round-trip, but if jobs share configuration via `<<: *base`, you may want to put the webhook block on the base anchor rather than each job. Review the diff carefully on those repos.
+- **Anchors and `<<:` merges**: ruamel preserves anchors on round-trip, but if jobs share configuration via `<<: *base`, you may want to put the webhook block on the base anchor rather than each job. Review the diff carefully on those repos. See the worked example below.
 - **No `bundle validate` built in**: run `databricks bundle validate` after `--apply` and before opening the PR — it'll catch any structural issue (rare, but cheap insurance).
 - **Per-target overrides**: by default, the script patches both base job definitions and per-target overrides (`targets.<env>.resources.jobs.<name>`). This is explicit but produces extra diff lines. Pass `--skip-target-overrides` to patch only base definitions and rely on bundle deep-merge to propagate webhook config into each target. When that flag is set, the script logs a WARNING for any override that already has its own `webhook_notifications` block — bundle merge would let the override's list win over the base, so those need a manual patch. See the worked example below for what each of the three cases produces.
+
+### Anchors and `<<:` merges: worked example
+
+Some bundles DRY up job configuration with a YAML anchor (`&name`) and merge key (`<<: *name`) so multiple jobs share defaults from one block. The patcher doesn't follow merge keys — it walks `resources.jobs.<name>` directly and patches each consumer job individually. That's correct but produces N copies of the same `webhook_notifications` block when there are N jobs sharing an anchor.
+
+**Starting state**
+
+```yaml
+# resources/jobs/etl.yml
+definitions:
+  job_defaults: &defaults
+    tags:
+      team: data-platform
+    email_notifications:
+      on_failure:
+        - alerts@example.com
+    timeout_seconds: 3600
+
+resources:
+  jobs:
+    extract_job:
+      <<: *defaults
+      name: extract
+      tasks: [...]
+    transform_job:
+      <<: *defaults
+      name: transform
+      tasks: [...]
+    load_job:
+      <<: *defaults
+      name: load
+      tasks: [...]
+```
+
+Three jobs, one anchor.
+
+**What the patcher does by default**
+
+```bash
+python3 patch_bundle_yaml.py --bundle-dir . --webhook-id WID --apply
+```
+
+It writes `webhook_notifications` into each consumer job:
+
+```yaml
+resources:
+  jobs:
+    extract_job:
+      <<: *defaults
+      name: extract
+      webhook_notifications:    # <-- added per-job
+        on_failure:
+          - id: WID
+        on_success:
+          - id: WID
+        on_start:
+          - id: WID
+      tasks: [...]
+    transform_job:
+      <<: *defaults
+      name: transform
+      webhook_notifications:    # <-- duplicated
+        on_failure:
+          - id: WID
+        on_success:
+          - id: WID
+        on_start:
+          - id: WID
+      tasks: [...]
+    load_job:
+      <<: *defaults
+      name: load
+      webhook_notifications:    # <-- duplicated again
+        on_failure:
+          - id: WID
+        on_success:
+          - id: WID
+        on_start:
+          - id: WID
+      tasks: [...]
+```
+
+Functionally correct, but 3× the diff. Adding/removing a destination later means three edits, not one.
+
+**What a hand-edit on the anchor looks like**
+
+Move the webhook block onto `&defaults` once and revert the per-job patches:
+
+```yaml
+definitions:
+  job_defaults: &defaults
+    tags:
+      team: data-platform
+    email_notifications:
+      on_failure:
+        - alerts@example.com
+    timeout_seconds: 3600
+    webhook_notifications:        # <-- added once on the anchor
+      on_failure:
+        - id: WID
+      on_success:
+        - id: WID
+      on_start:
+        - id: WID
+
+resources:
+  jobs:
+    extract_job:
+      <<: *defaults
+      name: extract
+      tasks: [...]
+    transform_job:
+      <<: *defaults
+      name: transform
+      tasks: [...]
+    load_job:
+      <<: *defaults
+      name: load
+      tasks: [...]
+```
+
+One block, three jobs. All consumers inherit `webhook_notifications` via the merge at deploy time. Future changes touch one place.
+
+**Why the patcher doesn't do this for you**
+
+- The anchor source isn't necessarily under `resources.jobs` — it might live in `definitions:` (as above), in a separate include file, or as a discarded `.base` key. The patcher only walks `resources.jobs.<name>`.
+- Anchors are often consumed by non-job resources too (pipelines, schedules). Patching the anchor blind could touch resources the patcher shouldn't.
+- Mutating through merge resolution while iterating consumers is fragile — exactly the kind of round-trip subtlety the script avoids.
+
+**How to spot anchors in a bundle**
+
+```bash
+grep -REn '<<:\s*\*|&[A-Za-z_]' path/to/bundle
+```
+
+Reveals every anchor definition (`&name`) and merge consumer (`<<: *name`). If you see the same anchor consumed by several jobs, consider doing the hand-edit instead of (or after reverting) the per-job patch.
+
+**Tl;dr:** patcher output is correct but verbose for anchor-heavy repos. Review the diff; for bundles where many jobs share a `<<: *base`, the cleaner long-term shape is one block on the anchor. The patcher's per-job writes are a safe default, not always the best one.
 
 ### Per-target overrides: worked example
 
