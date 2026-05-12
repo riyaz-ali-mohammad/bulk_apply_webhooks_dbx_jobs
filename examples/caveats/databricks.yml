@@ -28,7 +28,7 @@ variables:
       string, so running with --webhook-id <literal> against a job that
       already references ${var.webhook_id} produces a DUPLICATE entry —
       both the variable-resolved ID and the literal ID will receive POSTs.
-    default: "00000000-0000-0000-0000-000000000000"
+    default: "cf747d45-fd10-4a99-aa59-697799b09f01"
 
 include:
   - resources/*.yml
@@ -51,5 +51,5 @@ targets:
           name: analytics-prod
           webhook_notifications:
             on_failure:
-              - id: prod-only-pagerduty-uuid-aaaaaaaaaaaa
+              - id: 4d8bd599-90b9-4985-9e02-23935e9812f2
           timeout_seconds: 7200
