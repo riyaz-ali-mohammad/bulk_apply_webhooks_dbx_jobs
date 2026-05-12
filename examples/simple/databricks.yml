@@ -12,13 +12,6 @@ resources:
       name: webhook-test-job
       tags:
         webhook-test: simple
-      webhook_notifications:
-        on_failure:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
-        on_success:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
-        on_start:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
       tasks:
         - task_key: fail_me
           notebook_task:

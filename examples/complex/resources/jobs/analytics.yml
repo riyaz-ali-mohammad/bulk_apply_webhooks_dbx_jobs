@@ -1,6 +1,12 @@
-# Analytics job — already partially wired with webhook_notifications.
-# Useful for verifying the patcher's merge semantics: preserves existing
-# webhook ids (including variable references) and appends ours.
+# Analytics job — partially wired with webhook_notifications, so the
+# patcher exercises both its variable-aware-skip path and its
+# normal-create path on the same job:
+#   - on_failure has a fixed literal AND a ${var.webhook_id} entry.
+#     The patcher SKIPS this event list (variable ref present; would
+#     risk a deploy-time duplicate if the variable resolves to the
+#     literal --webhook-id). Logs a WARNING.
+#   - on_success and on_start do not exist yet. The patcher creates
+#     them and inserts the supplied --webhook-id.
 resources:
   jobs:
     analytics_job:
@@ -11,13 +17,9 @@ resources:
         on_failure:
           # Existing dedicated alert channel; must survive the merge.
           - id: "11111111-2222-3333-4444-555555555555"
-          # Variable reference is treated as an opaque string by the patcher.
+          # Variable reference — patcher treats this as opaque and skips
+          # the whole event list with a WARNING.
           - id: ${var.webhook_id}
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
-        on_success:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
-        on_start:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
       tasks:
         - task_key: run_report
           notebook_task:

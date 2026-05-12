@@ -6,13 +6,6 @@ resources:
       tags: &etl_tags
         team: data-platform
         cohort: webhook-rollout-1
-      webhook_notifications:
-        on_failure:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
-        on_success:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
-        on_start:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
       tasks:
         - task_key: extract
           notebook_task:
@@ -30,13 +23,6 @@ resources:
       schedule:
         quartz_cron_expression: "0 0 * * * ?"
         timezone_id: UTC
-      webhook_notifications:
-        on_failure:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
-        on_success:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
-        on_start:
-          - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
       tasks:
         - task_key: incremental
           notebook_task:

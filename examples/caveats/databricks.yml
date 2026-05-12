@@ -11,11 +11,10 @@
 #   3. Per-target overrides         -> targets.prod.resources.jobs.analytics_job below
 #
 # Suggested commands:
-#   # Default behavior (patches base + every per-target override)
+#   # Dry-run — patches base resources only; per-target overrides are detected
+#   # and INFO-logged. DAB merge will fan the base webhook out to every target
+#   # at deploy time without duplicates.
 #   python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID
-#
-#   # Skip target overrides — exposes the override-with-own-webhooks WARNING
-#   python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID --skip-target-overrides
 #
 bundle:
   name: caveats-bundle
@@ -40,13 +39,19 @@ targets:
 
   prod:
     mode: production
+    workspace:
+      root_path: /Workspace/Users/riyazali.mohammad@databricks.com/.bundle/${bundle.name}/${bundle.target}
     resources:
       jobs:
         # Caveat: per-target override has its OWN webhook_notifications.
-        # With --skip-target-overrides, the base's patched webhook is silently
-        # shadowed in prod by this list (bundle merge replaces lists, not
-        # concatenates). The patcher logs a WARNING when it detects this.
-        # Without --skip-target-overrides, the patcher rewrites this block too.
+        # The patcher never writes to target overrides — DAB deep-merge
+        # CONCATENATES webhook_notifications event lists at deploy time, so
+        # patching the base is enough to propagate the webhook into prod.
+        # In prod this override's `prod-only` destination survives alongside
+        # the base's patched webhook (concat yields both, no duplicates).
+        # If the override ever contained the same ID the patcher writes to
+        # base, the resulting concat would duplicate and Databricks would
+        # reject the deploy — the patcher logs a WARNING in that case.
         analytics_job:
           name: analytics-prod
           webhook_notifications:

@@ -1,11 +1,12 @@
 # Caveat: templated webhook IDs (`${var.webhook_id}`). This job already
 # wires up a webhook via a bundle variable — the typical setup for teams
 # that want a single source-of-truth for the destination ID across many
-# repos. The patcher treats the variable reference as an opaque string,
-# so running `patch_bundle_yaml.py --webhook-id <literal>` will APPEND
-# the literal ID alongside the variable, producing duplicate POSTs per
-# event. The patcher will not detect the duplication; review the diff
-# and either remove the literal entries or update the variable's default.
+# repos. The patcher detects the variable reference and SKIPS the event
+# list with a WARNING, because it can't resolve `${var.*}` and if the
+# variable resolves to the same destination at deploy, Databricks would
+# reject the deploy with `cannot update job: Duplicate webhook ids ...`.
+# Hand-edit if you intentionally want the patcher to layer additional
+# literal destinations alongside the variable.
 resources:
   jobs:
     reporting_job:

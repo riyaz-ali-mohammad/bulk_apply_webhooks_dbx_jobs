@@ -304,8 +304,10 @@ Automates the YAML edit above. Runs locally on a checked-out bundle repo, produc
 ### What it does
 
 - Reads `databricks.yml` plus every file matched by its `include:` glob patterns.
-- Finds every `resources.jobs.<name>` block (top-level and per-target `targets.<env>.resources.jobs.<name>`).
-- Merges the supplied webhook ID into each event list under `webhook_notifications`, inserting the block just before `tasks:` for review-friendly diffs.
+- Finds every base `resources.jobs.<name>` block and merges the supplied webhook ID into each event list under `webhook_notifications`, inserting the block just before `tasks:` for review-friendly diffs.
+- Per-target overrides (`targets.<env>.resources.jobs.<name>`) are **detected but never written to**. DAB deep-merge concatenates `webhook_notifications` event lists at deploy time, so the base patch propagates into every target automatically. Writing the override too would produce a duplicate that Databricks rejects with `cannot update job: Duplicate webhook ids ...` at deploy.
+- Skips any event list that already contains a `${var.*}` reference with a WARNING — the patcher can't resolve variables and could otherwise create a deploy-time duplicate when the variable resolves to the same destination.
+- Logs a WARNING when a per-target override already contains the same `--webhook-id` (the override + base concat would still produce a duplicate; hand-edit needed before deploy).
 - Preserves comments, key order, anchors, and quoting via `ruamel.yaml` round-trip.
 - Idempotent: re-running with the same webhook ID is a no-op.
 - Dry-run by default (prints unified diff); `--apply` writes files in place.
@@ -344,19 +346,21 @@ The owning team reviews the PR; their CI runs `databricks bundle deploy` on merg
                           bulk script.
 --job <name>              Limit to jobs whose `name:` field matches. Repeatable.
 --tag key=value | key     Filter by the job's YAML `tags:` block.
---skip-target-overrides   Skip `targets.<env>.resources.jobs.<name>` blocks.
-                          Tighter diffs; relies on bundle deep-merge to push
-                          the webhook config into each target.
 --apply                   Write files in place. Default: dry-run diff to stdout.
 -v, --verbose             DEBUG-level logging (logs "already has webhook" hits).
+
+Per-target overrides are always skipped (DAB deep-merge propagates the base
+patch into every target via list concatenation). There is no flag to write
+through to overrides — doing so would produce duplicates that Databricks
+rejects at deploy.
 ```
 
 ### Caveats worth flagging to bundle owners
 
-- **Templated webhook IDs**: bundles using `${var.webhook_id}` should add the variable definition manually instead of using this script. The script writes literal IDs.
+- **Templated webhook IDs**: the patcher writes literal IDs and can't resolve `${var.*}` references. To avoid producing a duplicate that Databricks rejects at deploy time (`cannot update job: Duplicate webhook ids ...`), the patcher now **skips any event list whose existing entries include a `${var.*}` reference** and logs a WARNING. Hand-edit the affected files if you need both. See the worked example below.
 - **Anchors and `<<:` merges**: ruamel preserves anchors on round-trip, but if jobs share configuration via `<<: *base`, you may want to put the webhook block on the base anchor rather than each job. Review the diff carefully on those repos. See the worked example below.
 - **No `bundle validate` built in**: run `databricks bundle validate` after `--apply` and before opening the PR — it'll catch any structural issue (rare, but cheap insurance).
-- **Per-target overrides**: by default, the script patches both base job definitions and per-target overrides (`targets.<env>.resources.jobs.<name>`). This is explicit but produces extra diff lines. Pass `--skip-target-overrides` to patch only base definitions and rely on bundle deep-merge to propagate webhook config into each target. When that flag is set, the script logs a WARNING for any override that already has its own `webhook_notifications` block — bundle merge would let the override's list win over the base, so those need a manual patch. See the worked example below for what each of the three cases produces.
+- **Per-target overrides**: the patcher never writes to `targets.<env>.resources.jobs.<name>` blocks. DAB deep-merge **concatenates** `webhook_notifications` event lists at deploy time, so the base patch alone propagates into every target automatically. Patching the override too would produce `[base_webhook, override_webhook]` lists with duplicates that Databricks rejects (`cannot update job: Duplicate webhook ids ...`). If an override already contains the same `--webhook-id`, the patcher logs a WARNING — the resulting concat would still produce a duplicate, so the override needs a hand-edit before `bundle deploy`. See the worked example below.
 
 ### Anchors and `<<:` merges: worked example
 
@@ -498,22 +502,20 @@ Reveals every anchor definition (`&name`) and merge consumer (`<<: *name`). If y
 
 ### Per-target overrides: worked example
 
-Using the `examples/complex/` bundle in this repo as a starting point — it has an `analytics_job` defined in the base and partially overridden in the `prod` target:
+DAB deep-merge **concatenates** `webhook_notifications` event lists at deploy time. The patcher relies on this: it only ever writes to base `resources.jobs.<name>` blocks, and the merge fans the webhook out to every target automatically. There's no flag — overrides are always skipped, and the patcher logs a WARNING in the one case where you'd hit a deploy-rejecting duplicate.
+
+**Starting state** (the `analytics_job` shape from `examples/caveats/`):
 
 ```yaml
-# examples/complex/resources/jobs/analytics.yml  (base)
+# resources/analytics.yml — base
 resources:
   jobs:
     analytics_job:
       name: analytics
-      tags:
-        team: analytics
-      tasks:
-        - task_key: run_report
-          notebook_task:
-            notebook_path: ../../notebooks/common.py
+      tags: { team: analytics }
+      tasks: [...]
 
-# examples/complex/databricks.yml  (per-target override)
+# databricks.yml — prod target adds a prod-only failure destination
 targets:
   prod:
     mode: production
@@ -521,111 +523,157 @@ targets:
       jobs:
         analytics_job:
           name: analytics-prod
-          timeout_seconds: 7200
-```
-
-The override touches only `name` and `timeout_seconds`. No `webhook_notifications` of its own.
-
-#### Case 1 — default behavior: patch base AND override
-
-```bash
-python3 patch_bundle_yaml.py --bundle-dir examples/complex --webhook-id WID --apply
-```
-
-Both blocks get the same `webhook_notifications` written into them:
-
-```yaml
-# resources/jobs/analytics.yml — base, patched
-analytics_job:
-  name: analytics
-  tags:
-    team: analytics
-  webhook_notifications:        # <-- added
-    on_failure:
-      - id: WID
-    on_success:
-      - id: WID
-    on_start:
-      - id: WID
-  tasks: [...]
-
-# databricks.yml — override ALSO patched
-targets:
-  prod:
-    resources:
-      jobs:
-        analytics_job:
-          name: analytics-prod
-          webhook_notifications:    # <-- redundantly added
-            on_failure:
-              - id: WID
-            on_success:
-              - id: WID
-            on_start:
-              - id: WID
-          timeout_seconds: 7200
-```
-
-The override patch is redundant — at deploy time, bundle deep-merge would already have propagated the base's `webhook_notifications` into prod. But the diff is explicit, which some reviewers prefer.
-
-#### Case 2 — `--skip-target-overrides`, override has no own webhook block (INFO log)
-
-```bash
-python3 patch_bundle_yaml.py --bundle-dir examples/complex --webhook-id WID --skip-target-overrides --apply
-```
-
-```
-INFO  databricks.yml :: targets.prod.resources.jobs.analytics_job -> skipped (target override)
-```
-
-Only the base file is patched. `databricks.yml` is untouched. At deploy time, bundle deep-merge combines base + override → prod ends up with `name: analytics-prod`, `timeout_seconds: 7200`, **and** `webhook_notifications: {...}` from the base. Same operational result as Case 1, half the diff lines. This is the happy path for `--skip-target-overrides`.
-
-#### Case 3 — `--skip-target-overrides`, override HAS its own webhook block (WARNING log)
-
-Imagine prod already wired up a different destination (e.g. a PagerDuty-only one):
-
-```yaml
-# databricks.yml — override has its own webhook_notifications
-targets:
-  prod:
-    resources:
-      jobs:
-        analytics_job:
-          name: analytics-prod
           webhook_notifications:
             on_failure:
-              - id: prod-pagerduty-destination-uuid
+              - id: prod-only-pagerduty-uuid
           timeout_seconds: 7200
 ```
 
-Running with `--skip-target-overrides`:
+Run the patcher:
+
+```bash
+python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID --apply
+```
+
+**Log output**
 
 ```
-WARNING  databricks.yml :: targets.prod.resources.jobs.analytics_job -> skipped (target override; has own webhook_notifications, may need manual patch)
+INFO   resources/analytics.yml :: resources.jobs.analytics_job -> patched
+INFO   databricks.yml :: targets.prod.resources.jobs.analytics_job -> skipped (target override; DAB merge propagates base patch)
 ```
 
-What actually ships:
-
-- Base gets the new `WID` webhook patched in.
-- prod's override is untouched.
-- **Bundle deep-merge replaces lists, doesn't concatenate them.** So in prod, the override's `webhook_notifications: { on_failure: [pagerduty-uuid] }` wins entirely — the base's `WID` never reaches prod. Prod is silently missing the rollout.
-
-Fix by hand-editing `databricks.yml` to add `WID` into prod's existing event lists:
+**Patched base file**
 
 ```yaml
-webhook_notifications:
-  on_failure:
-    - id: prod-pagerduty-destination-uuid
-    - id: WID            # <-- add by hand so prod gets both
-  on_success:
-    - id: WID            # <-- on_success/on_start didn't exist before; add
-  on_start:
-    - id: WID
+# resources/analytics.yml — webhook_notifications written to the base only
+resources:
+  jobs:
+    analytics_job:
+      name: analytics
+      tags: { team: analytics }
+      webhook_notifications:       # <-- added by patcher
+        on_failure:
+          - id: WID
+        on_success:
+          - id: WID
+        on_start:
+          - id: WID
+      tasks: [...]
 ```
 
-Or, if you don't want the WARNING-then-manual-edit dance, drop `--skip-target-overrides` and let the patcher write through (Case 1). That always wins because the override's `webhook_notifications` gets fully rewritten.
+The prod override in `databricks.yml` is untouched.
 
-**Tl;dr:** `--skip-target-overrides` is great when overrides only customize unrelated fields (name, timeout, tags). It's a footgun when an override defines its own `webhook_notifications`, because DAB list-merge semantics are "override replaces base." The WARNING is your only signal.
+**What ships at `bundle deploy`**
+
+DAB concatenates per-event for each target:
+
+| Event | base list (from analytics.yml) | prod override (from databricks.yml) | result in prod |
+|---|---|---|---|
+| `on_failure` | `[WID]` | `[prod-only-pagerduty-uuid]` | `[WID, prod-only-pagerduty-uuid]` |
+| `on_success` | `[WID]` | _(none)_ | `[WID]` |
+| `on_start` | `[WID]` | _(none)_ | `[WID]` |
+
+No duplicates. The rollout webhook reaches every target, and prod keeps its specialty failure destination.
+
+#### The one case that needs a hand-edit
+
+If an override already contains the same `--webhook-id` the patcher would add to the base, DAB concat would produce `[WID, ..., WID]` and Databricks rejects the deploy. The patcher detects this and warns:
+
+```yaml
+# Hypothetical: prod override already lists WID alongside its specialty destination
+targets:
+  prod:
+    resources:
+      jobs:
+        analytics_job:
+          webhook_notifications:
+            on_failure:
+              - id: WID
+              - id: prod-only-pagerduty-uuid
+```
+
+```
+WARNING  databricks.yml :: targets.prod.resources.jobs.analytics_job -> override already contains webhook WID on events ['on_failure']. DAB merge will concatenate base + override at deploy, producing duplicates that Databricks rejects. Hand-edit the override to remove the redundant entries before `bundle deploy`.
+```
+
+Fix by hand: drop the `- id: WID` line from the override. The base patch supplies `WID` to every target via concat anyway.
+
+**Tl;dr**: patcher writes base only, DAB merge fans the webhook out to every target, override-specific destinations survive untouched. The only WARNING path is an override that already lists the same ID the patcher is adding to base.
+
+### Templated webhook IDs: worked example
+
+Bundles often indirect the destination ID through a variable so one ID lives in `databricks.yml` and every job references it via `${var.webhook_id}`. The patcher walks each `webhook_notifications` list literally — it doesn't resolve variables, doesn't know what `${var.webhook_id}` will be at deploy time, and **could produce a duplicate that Databricks rejects with `cannot update job: Duplicate webhook ids ...`**. To prevent that, the patcher now skips any event list that already contains a `${var.*}` entry and logs a WARNING.
+
+**Starting state**
+
+```yaml
+# databricks.yml
+variables:
+  webhook_id:
+    default: "4c6145d0-1fbe-4ae0-b019-6f621361a04c"
+
+# resources/reporting.yml
+resources:
+  jobs:
+    reporting_job:
+      name: reporting
+      webhook_notifications:
+        on_failure:
+          - id: ${var.webhook_id}
+        on_success:
+          - id: ${var.webhook_id}
+        on_start:
+          - id: ${var.webhook_id}
+      tasks: [...]
+```
+
+**What happens now**
+
+```bash
+python3 patch_bundle_yaml.py --bundle-dir . --webhook-id 4c6145d0-1fbe-4ae0-b019-6f621361a04c --apply
+```
+
+```
+WARNING  resources/reporting.yml :: resources.jobs.reporting_job -> events ['on_failure', 'on_success', 'on_start'] skipped: existing ${var.*} reference. Patcher writes literal IDs; if the variable resolves to the same destination, Databricks rejects the deploy with 'Duplicate webhook ids'. Hand-edit if needed.
+Done. mode=APPLY files_changed=0 jobs_seen=1 jobs_matched=1 jobs_patched=0 overrides_skipped=0 var_skipped_events=3
+```
+
+`reporting.yml` is left alone — the `${var.webhook_id}` references stay, no literal is appended. Bundle deploys cleanly.
+
+**Previous behavior (before this skip-with-WARNING rule)**
+
+The patcher would append the literal alongside the variable:
+
+```yaml
+on_failure:
+  - id: ${var.webhook_id}
+  - id: 4c6145d0-1fbe-4ae0-b019-6f621361a04c
+```
+
+Then `databricks bundle deploy` would fail terraform apply:
+
+```
+Error: cannot update job: Duplicate webhook ids '4c6145d0-1fbe-4ae0-b019-6f621361a04c' found for on_start
+```
+
+…because the variable resolves to the same ID. This was the templated-ID caveat firing — now headed off at the patcher.
+
+**When you actually do want both**
+
+If you're intentionally layering destinations (e.g. variable resolves to one team's channel and you want to also notify a second team via a literal), the skip is in your way. Two clean options:
+
+1. Hand-edit the affected event list to add the literal entry. The patcher's idempotency check will leave it alone on re-runs (the literal is already present; the variable is still skipped).
+2. Remove the `${var.*}` reference first if you want the patcher to manage that event list going forward.
+
+The patcher won't second-guess either choice; it just refuses to mix variables and literals automatically.
+
+**Detection without running the patcher**
+
+```bash
+grep -REn '\$\{var\.' path/to/bundle
+```
+
+Lists every variable reference in the bundle. If any sit inside a `webhook_notifications` block, expect the patcher to skip those event lists.
 
 ---
 
@@ -749,32 +797,31 @@ The `examples/` directory contains three reference Asset Bundles you can use to 
 ### Caveats-bundle workflow
 
 ```bash
-# 1. Confirm the bundle parses cleanly before any patcher run
-cd examples/caveats
-databricks bundle validate
-cd ../..
+# 1. Confirm the bundle parses cleanly
+cd examples/caveats && databricks bundle validate && cd ../..
 
-# 2. (Optional) Deploy to your dev workspace so you can compare the
-#    before/after of an actual deploy.
-cd examples/caveats
-databricks bundle deploy
-cd ../..
+# 2. Deploy a clean baseline to dev (and optionally prod) so you can
+#    compare workspace state before vs after the patcher run.
+cd examples/caveats && databricks bundle deploy && cd ../..
+cd examples/caveats && databricks bundle deploy -t prod && cd ../..   # optional
 
-# 3. Default behavior — patches base + every per-target override.
-#    Inspect the diff: you'll see the per-job duplication from the
-#    anchor caveat, the literal-ID-appended-to-${var.webhook_id} from
-#    the variable caveat, and both the base and the prod override of
-#    analytics_job getting patched.
+# 3. Dry-run the patcher. Expected output:
+#    - resources/etl.yml :: extract_job -> patched (anchor target; the
+#      <<: *defaults consumers inherit it via the merge, no per-job duplication).
+#    - resources/analytics.yml :: analytics_job -> patched
+#    - resources/reporting.yml :: WARNING for all 3 events skipped
+#      (existing ${var.webhook_id} references; patcher refuses to mix
+#      literals + variables).
+#    - databricks.yml :: targets.prod.resources.jobs.analytics_job ->
+#      INFO "skipped (target override; DAB merge propagates base patch)".
 python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID-LITERAL-12345
 
-# 4. --skip-target-overrides — exposes the WARNING for the prod override
-#    that already has its own webhook_notifications.
-python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID-LITERAL-12345 --skip-target-overrides
-
-# 5. Apply (after reviewing the diff) and redeploy to compare against
-#    the pre-patch deploy from step 2.
+# 4. Apply, then redeploy to both targets. Both succeed — DAB concat
+#    yields [WID, prod-only-pagerduty-uuid] on prod's on_failure, with
+#    no duplicates.
 python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID-LITERAL-12345 --apply
 cd examples/caveats && databricks bundle deploy && cd ../..
+cd examples/caveats && databricks bundle deploy -t prod && cd ../..
 ```
 
 Full smoke-test workflow against the simple bundle:
