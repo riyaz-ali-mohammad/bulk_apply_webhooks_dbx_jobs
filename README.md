@@ -10,6 +10,16 @@ All three scripts default to dry-run and are idempotent. The bulk and patch scri
 
 ---
 
+## What `create_webhook_destination.py` does
+
+- Validates the supplied URL is `http(s)://`.
+- Lists existing notification destinations via the Databricks SDK and checks for a `display_name` collision.
+- If a destination with that name already exists, prints its ID/URL and exits 0 (no mutation — idempotent on re-run).
+- Otherwise creates a new generic-webhook destination via `notification_destinations.create()`.
+- Prints a human-readable summary including the destination ID — that ID is what `bulk_apply_webhooks.py` and `patch_bundle_yaml.py` consume downstream.
+
+---
+
 ## What `bulk_apply_webhooks.py` does
 
 - Enumerates jobs via `GET /api/2.2/jobs/list` (paginated).
@@ -75,19 +85,78 @@ databricks current-user me
 
 ## Get a webhook destination ID
 
-The bulk script takes a destination **ID**, not a URL. You have two options:
+The bulk script takes a destination **ID**, not a URL. You have two options for getting one.
 
-**Option A — create one programmatically (`create_webhook_destination.py`).** Useful when the receiving URL is already known and you want a scriptable, idempotent setup:
+### Option A — create one programmatically (`create_webhook_destination.py`)
+
+Use this when you already have the receiving URL (Slack incoming-webhook, PagerDuty bridge, a `webhook.site` test endpoint, your team's HTTP listener, etc.) and want a scriptable, idempotent setup. The script wraps the `POST /api/2.0/notification-destinations` endpoint via the Databricks SDK.
+
+**What it does**
+
+- Validates the URL is `http(s)://` and warns if plain `http` (payloads would be unencrypted).
+- Looks up existing destinations and checks for one with the same `display_name`. If found, prints its details and exits 0 — no mutation. This makes the script safe to run repeatedly in CI or setup pipelines.
+- If no existing destination matches, calls `notification_destinations.create()` with a `Config(generic_webhook=...)` payload. The destination type is inferred from the populated sub-config — you don't need to specify it.
+- Prints a human-readable summary on success: `id`, `display_name`, `type`, and `url`.
+- Dry-run by default. Pass `--apply` to actually create.
+
+**Quick start**
+
 ```bash
-# Dry-run first
-python3 create_webhook_destination.py --url https://hooks.example.com/abc --name my-team-webhook
+# Dry-run first — confirms auth, checks for a name collision, doesn't create anything
+python3 create_webhook_destination.py \
+    --url https://hooks.example.com/abc \
+    --name my-team-webhook
 
-# Actually create (idempotent: re-running with the same --name returns the existing ID)
-python3 create_webhook_destination.py --url https://hooks.example.com/abc --name my-team-webhook --apply
+# Apply
+python3 create_webhook_destination.py \
+    --url https://hooks.example.com/abc \
+    --name my-team-webhook \
+    --apply
 ```
-The script prints the ID, display name, and URL on success. Re-running with a `--name` that already exists is a no-op — it reports the existing destination without mutating anything.
 
-**Option B — create one manually in Admin Settings → Notifications**, then look up its ID:
+Output on a fresh create looks like:
+```
+Created:
+  id:           4c6145d0-1fbe-4ae0-b019-6f621361a04c
+  display_name: my-team-webhook
+  type:         WEBHOOK
+  url:          https://hooks.example.com/abc
+```
+
+Re-running the same command is a no-op:
+```
+Destination already exists with display_name='my-team-webhook':
+  id:           4c6145d0-1fbe-4ae0-b019-6f621361a04c
+  ...
+```
+
+**CLI reference**
+
+```
+--url <url>             Required. Webhook URL the destination will POST to.
+                        Must be http(s)://. Warns on plain http.
+--name <name>           Required. Display name for the destination.
+                        Used as the idempotency key — re-running with the
+                        same name returns the existing destination.
+--apply                 Actually create. Default: dry-run.
+--profile <name>        Databricks CLI profile to use.
+                        Falls back to the standard SDK credential chain.
+-v, --verbose           DEBUG-level logging (SDK HTTP traces).
+```
+
+**Required permissions**
+
+The principal you authenticate as needs **workspace-admin** to create notification destinations. A regular "Can Manage" job principal can attach an existing destination but cannot create new ones — you'll get a `PERMISSION_DENIED` on `--apply` if running unprivileged. The dry-run path only calls `list`, which most users can do.
+
+**Caveats**
+
+- **No URL update path.** This script only creates destinations. If you need to change the URL of an existing destination, update it in the UI or via `databricks notification-destinations update`. The script intentionally won't mutate existing destinations because that could silently redirect notifications mid-run.
+- **No auth headers.** The script creates an unauthenticated `generic_webhook` destination. If your receiving endpoint requires bearer tokens or signing keys, configure them in the Admin Settings UI instead — the underlying API supports a `username`/`password` pair, but exposing those as flags risks them landing in shell history.
+- **Display name uniqueness.** The Databricks API itself doesn't strictly enforce unique names, but this script relies on name as the idempotency key. If you already have duplicates, the script picks whichever the API returns first.
+
+### Option B — create one manually
+
+Create the destination in **Admin Settings → Notifications**, then look up its ID via the CLI:
 ```bash
 # By display name, returning just the ID:
 databricks notification-destinations list -o json \
@@ -344,6 +413,12 @@ The Jobs `list` API has no server-side tag filter, so even targeted runs page th
 
 **Run reports `errored=N`**
 Inspect the log for `update failed:` lines. Most commonly: rate-limit exhaustion (raise `--max-retries` and `--base-sleep`) or per-job permission. Re-running is safe — already-applied jobs are no-ops.
+
+**`create_webhook_destination.py --apply` fails with `PERMISSION_DENIED`**
+Creating notification destinations requires workspace-admin. Either run the script as an admin, or have an admin run it once and share the resulting ID with the rest of the team via the same `WEBHOOK_ID` variable.
+
+**`create_webhook_destination.py` reports "already exists" but you don't see it in the UI**
+The display-name lookup is API-driven and case-sensitive. Check `databricks notification-destinations list` to see exactly what's there; the destination may exist under a slightly different name.
 
 ---
 
