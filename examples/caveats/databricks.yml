@@ -1,0 +1,55 @@
+# Caveats-exercising bundle for patch_bundle_yaml.py.
+#
+# Deliberately reproduces every footgun listed in the README's
+# "Caveats worth flagging to bundle owners" section, so you can dry-run
+# the patcher and inspect the resulting diff against a real-world-shaped
+# bundle.
+#
+# Caveats reproduced:
+#   1. Templated webhook IDs        -> resources/reporting.yml
+#   2. Anchors and `<<:` merges     -> resources/etl.yml
+#   3. Per-target overrides         -> targets.prod.resources.jobs.analytics_job below
+#
+# Suggested commands:
+#   # Default behavior (patches base + every per-target override)
+#   python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID
+#
+#   # Skip target overrides — exposes the override-with-own-webhooks WARNING
+#   python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID --skip-target-overrides
+#
+bundle:
+  name: caveats-bundle
+
+variables:
+  webhook_id:
+    description: |
+      Notification destination ID indirected via a bundle variable. The
+      patcher writes LITERAL IDs and treats this reference as an opaque
+      string, so running with --webhook-id <literal> against a job that
+      already references ${var.webhook_id} produces a DUPLICATE entry —
+      both the variable-resolved ID and the literal ID will receive POSTs.
+    default: "00000000-0000-0000-0000-000000000000"
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+
+  prod:
+    mode: production
+    resources:
+      jobs:
+        # Caveat: per-target override has its OWN webhook_notifications.
+        # With --skip-target-overrides, the base's patched webhook is silently
+        # shadowed in prod by this list (bundle merge replaces lists, not
+        # concatenates). The patcher logs a WARNING when it detects this.
+        # Without --skip-target-overrides, the patcher rewrites this block too.
+        analytics_job:
+          name: analytics-prod
+          webhook_notifications:
+            on_failure:
+              - id: prod-only-pagerduty-uuid-aaaaaaaaaaaa
+          timeout_seconds: 7200

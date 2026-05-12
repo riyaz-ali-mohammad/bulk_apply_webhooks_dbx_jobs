@@ -740,10 +740,42 @@ The display-name lookup is API-driven and case-sensitive. Check `databricks noti
 
 ## Example bundles (reference)
 
-The `examples/` directory contains two reference Asset Bundles you can use to validate both scripts end-to-end:
+The `examples/` directory contains three reference Asset Bundles you can use to validate both scripts end-to-end:
 
 - **`examples/simple/`** — single-job bundle, single target. Good for the smoke-test workflow below.
 - **`examples/complex/`** — multi-file bundle exercising variables, `include:` globs, YAML anchors/aliases, per-target overrides, and a mix of job and pipeline resources. Useful for stress-testing the patcher.
+- **`examples/caveats/`** — purpose-built to hit every footgun in the "Caveats worth flagging to bundle owners" list in one place: a `${var.webhook_id}` reference, a `<<: *defaults` anchor shared across three jobs, and a per-target override that defines its own `webhook_notifications`. Use this when you want to see exactly how the patcher behaves on each caveat. Walkthrough below.
+
+### Caveats-bundle workflow
+
+```bash
+# 1. Confirm the bundle parses cleanly before any patcher run
+cd examples/caveats
+databricks bundle validate
+cd ../..
+
+# 2. (Optional) Deploy to your dev workspace so you can compare the
+#    before/after of an actual deploy.
+cd examples/caveats
+databricks bundle deploy
+cd ../..
+
+# 3. Default behavior — patches base + every per-target override.
+#    Inspect the diff: you'll see the per-job duplication from the
+#    anchor caveat, the literal-ID-appended-to-${var.webhook_id} from
+#    the variable caveat, and both the base and the prod override of
+#    analytics_job getting patched.
+python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID-LITERAL-12345
+
+# 4. --skip-target-overrides — exposes the WARNING for the prod override
+#    that already has its own webhook_notifications.
+python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID-LITERAL-12345 --skip-target-overrides
+
+# 5. Apply (after reviewing the diff) and redeploy to compare against
+#    the pre-patch deploy from step 2.
+python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID-LITERAL-12345 --apply
+cd examples/caveats && databricks bundle deploy && cd ../..
+```
 
 Full smoke-test workflow against the simple bundle:
 

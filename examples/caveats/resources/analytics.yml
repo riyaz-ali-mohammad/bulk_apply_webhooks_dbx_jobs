@@ -1,0 +1,15 @@
+# Plain base definition for analytics_job. The interesting bit lives in
+# the prod target inside databricks.yml: the per-target override there
+# defines its OWN webhook_notifications block. That's the scenario
+# `--skip-target-overrides` warns about (override list wins over base
+# under DAB merge semantics, so the base patch is silently shadowed).
+resources:
+  jobs:
+    analytics_job:
+      name: analytics
+      tags:
+        team: analytics
+      tasks:
+        - task_key: run_report
+          notebook_task:
+            notebook_path: ../notebooks/common.py

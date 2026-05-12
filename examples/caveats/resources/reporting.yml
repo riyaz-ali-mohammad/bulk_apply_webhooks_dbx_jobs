@@ -1,0 +1,25 @@
+# Caveat: templated webhook IDs (`${var.webhook_id}`). This job already
+# wires up a webhook via a bundle variable — the typical setup for teams
+# that want a single source-of-truth for the destination ID across many
+# repos. The patcher treats the variable reference as an opaque string,
+# so running `patch_bundle_yaml.py --webhook-id <literal>` will APPEND
+# the literal ID alongside the variable, producing duplicate POSTs per
+# event. The patcher will not detect the duplication; review the diff
+# and either remove the literal entries or update the variable's default.
+resources:
+  jobs:
+    reporting_job:
+      name: reporting
+      tags:
+        team: analytics
+      webhook_notifications:
+        on_failure:
+          - id: ${var.webhook_id}
+        on_success:
+          - id: ${var.webhook_id}
+        on_start:
+          - id: ${var.webhook_id}
+      tasks:
+        - task_key: build_report
+          notebook_task:
+            notebook_path: ../notebooks/common.py
