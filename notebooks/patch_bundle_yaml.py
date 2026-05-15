@@ -33,8 +33,12 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -q -r ../requirements.txt
+# MAGIC %pip install -q ruamel.yaml
 # MAGIC dbutils.library.restartPython()
+# MAGIC # ruamel.yaml is the only dep this notebook needs that isn't in the
+# MAGIC # Databricks runtime. Do NOT install databricks-sdk here — the runtime
+# MAGIC # ships it pinned to a protobuf-compatible version; upgrading via pip
+# MAGIC # breaks PySpark.
 
 # COMMAND ----------
 

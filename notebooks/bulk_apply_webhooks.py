@@ -38,8 +38,11 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -q -r ../requirements.txt
-# MAGIC dbutils.library.restartPython()
+# MAGIC %md
+# MAGIC No `%pip install` needed — this notebook only imports `databricks-sdk`,
+# MAGIC which is pre-installed in the Databricks runtime. Installing it again
+# MAGIC from PyPI would upgrade `protobuf` past the runtime's pinned version
+# MAGIC and break PySpark (the Delta write below).
 
 # COMMAND ----------
 

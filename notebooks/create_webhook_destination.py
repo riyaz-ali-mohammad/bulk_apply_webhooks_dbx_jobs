@@ -19,8 +19,9 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -q -r ../requirements.txt
-# MAGIC dbutils.library.restartPython()
+# MAGIC %md
+# MAGIC No `%pip install` needed — this notebook only imports `databricks-sdk`,
+# MAGIC which is pre-installed in the Databricks runtime.
 
 # COMMAND ----------
 
