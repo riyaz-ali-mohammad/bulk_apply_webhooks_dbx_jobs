@@ -22,7 +22,14 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.settings import Config, GenericWebhookConfig
+
+# We use w.api_client.do() (raw REST) instead of w.notification_destinations.*
+# typed methods. The Databricks runtime ships an older SDK (e.g. 0.20.0) where
+# the typed `notification_destinations` API and its `Config`/`GenericWebhookConfig`
+# wrappers do not exist. `api_client.do()` is core SDK plumbing that's been
+# stable across versions, so this works on both the runtime SDK and recent
+# pip-installed releases.
+_API_PATH = "/api/2.0/notification-destinations"
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,20 +50,37 @@ def validate_url(url: str) -> None:
         logging.warning("URL uses http://, not https:// — webhook payloads will be sent unencrypted.")
 
 
+def _iter_destinations(w: WorkspaceClient):
+    """Page through GET /api/2.0/notification-destinations, yielding raw dicts.
+
+    The list endpoint omits the `config` field (admin-only, only populated on
+    create/get-by-id), so URL info isn't available here — only id/display_name/
+    destination_type."""
+    query = {}
+    while True:
+        resp = w.api_client.do("GET", _API_PATH, query=query) or {}
+        for d in resp.get("results", []) or []:
+            yield d
+        token = resp.get("next_page_token")
+        if not token:
+            return
+        query["page_token"] = token
+
+
 def find_existing(w: WorkspaceClient, name: str):
-    for d in w.notification_destinations.list():
-        if d.display_name == name:
+    for d in _iter_destinations(w):
+        if d.get("display_name") == name:
             return d
     return None
 
 
-def print_summary(label: str, dest) -> None:
-    cfg = dest.config.generic_webhook if dest.config else None
-    url = cfg.url if cfg and cfg.url else "(redacted by API)"
+def print_summary(label: str, dest: dict) -> None:
+    cfg = (dest.get("config") or {}).get("generic_webhook") or {}
+    url = cfg.get("url") or "(redacted by API)"
     print(f"{label}")
-    print(f"  id:           {dest.id}")
-    print(f"  display_name: {dest.display_name}")
-    print(f"  type:         {dest.destination_type.name if dest.destination_type else '?'}")
+    print(f"  id:           {dest.get('id')}")
+    print(f"  display_name: {dest.get('display_name')}")
+    print(f"  type:         {dest.get('destination_type') or '?'}")
     print(f"  url:          {url}")
 
 
@@ -96,11 +120,15 @@ def run(
         logging.info("Re-run with apply=True to actually create it.")
         return 0
 
-    dest = w.notification_destinations.create(
-        display_name=name,
-        config=Config(generic_webhook=GenericWebhookConfig(url=url)),
+    dest = w.api_client.do(
+        "POST",
+        _API_PATH,
+        body={
+            "display_name": name,
+            "config": {"generic_webhook": {"url": url}},
+        },
     )
-    print_summary("Created:", dest)
+    print_summary("Created:", dest or {})
     return 0
 
 
