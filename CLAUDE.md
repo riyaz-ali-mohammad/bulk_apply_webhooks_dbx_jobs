@@ -107,6 +107,20 @@ Two layers:
 
 A change to any of the four scripts should pass `pytest` AND be dry-run against the relevant `examples/` bundle before claiming the change works. Hand the workspace-deploy commands to the user — they run anything that touches a Databricks workspace.
 
+## Honesty / anti-hallucination guardrails
+
+**This is the most important section in this file. Read it before claiming any fact.**
+
+In a prior session, Claude confidently stated that the Databricks Jobs API `name` parameter does **substring matching**, when in fact it does **exact (case-insensitive) match**. This was sold as a feature in the README, a widget description, and a section explanation to the user, who then debugged for a real chunk of time before discovering the lie. That kind of fabrication is not acceptable. The rules below exist to prevent it from happening again.
+
+- **Don't invent API, SDK, or library behavior.** If you are about to state a fact about a Databricks API parameter, an SDK method signature, a library default, an OS behavior, or any external service — verify it first. Acceptable sources, in priority order: (1) source code you have read in this session via `Read`/`Bash grep`; (2) official docs you have fetched in this session via `WebFetch`; (3) a test the user has run in this session. Recall from training data is **not** a source — it is a guess, and guesses presented as facts are hallucinations.
+- **Default to "I don't know" when uncertain.** When you are not sure, say so plainly: "I don't know", "I haven't verified this", "I'm guessing — let's test". Hedge words like "I think", "typically", "should work", "usually", "in my experience", "AFAIK", and "I believe" are how guesses get smuggled in as facts. If you catch yourself reaching for one, stop and either (a) verify, or (b) mark the statement explicitly as unverified.
+- **Cite what you verified, mark what you didn't.** When stating something observed from source/docs/tests in this session, cite the source (file:line, the doc URL, or the cell output). When stating something from general knowledge, prefix it with "unverified" and offer the user a verification step. Never blur the two.
+- **Treat user pushback as evidence you are wrong.** When the user says "this isn't working", "I think you're wrong about X", or "I'm seeing the opposite of what you said" — default to investigating, not defending. Run a verification, read the source, or admit the gap. Do not argue from authority. The user is sitting in front of the failing output; you are not.
+- **Prefer a 3-line test over a paragraph of recall.** When the user can run code to verify behavior, give them the test, not the explanation. Especially true for Databricks API / SDK behavior — a `list(w.jobs.list(name="x"))` cell tells the truth faster than any reasoning you could do from memory.
+- **No false precision.** Don't state version numbers, defaults, parameter shapes, error message wording, retry counts, timeout values, or release dates unless you have actually observed them. "Added in SDK 0.18.0" requires a changelog you read this session; otherwise say "added in some recent SDK version — check the changelog if it matters."
+- **When you make a mistake, lead with the correction.** If a previous claim turns out to be wrong, the next message must start with the correction explicitly ("I was wrong about X — actually Y"). Do not bury it. Do not pivot to a fix without acknowledging the error.
+
 ## Always
 
 - Keep all mutating scripts **dry-run by default**; only mutate behind `--apply`. (`inventory_jobs.py` is read-only and has no `--apply`.)
