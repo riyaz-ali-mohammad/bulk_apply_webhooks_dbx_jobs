@@ -36,17 +36,24 @@ End-to-end validation against a real workspace is still manual via the `examples
 
 ```
 .
-├── inventory_jobs.py              # Read-only: walks jobs/list, classifies BUNDLE vs DIRECT, writes jobs_inventory.csv.
-├── bulk_apply_webhooks.py         # Workspace-side: walks jobs/list, attaches webhook, inventories bundle jobs to bundle_jobs.csv.
+├── inventory_jobs.py              # Read-only: walks jobs/list, classifies BUNDLE vs DIRECT, writes jobs_inventory.csv (CLI) or Delta (notebook).
+├── bulk_apply_webhooks.py         # Workspace-side: walks jobs/list, attaches webhook, inventories bundle jobs to bundle_jobs.csv (CLI) or Delta (notebook).
 ├── patch_bundle_yaml.py           # Local-checkout-side: round-trip YAML edit of DAB resources.
 ├── create_webhook_destination.py  # One-shot: create a generic-webhook Notification Destination.
 ├── requirements.txt               # Just databricks-sdk and ruamel.yaml.
 ├── requirements-dev.txt           # Pulls in requirements.txt + pytest.
 ├── pytest.ini                     # testpaths=tests, pythonpath=. so tests can import top-level scripts.
 ├── README.md                      # Long-form user docs; cite section names when changing behavior.
+├── notebooks/                     # Databricks source-format notebooks (.py with "# Databricks notebook source" header).
+│   ├── _auth.py                       # Shared client-builder used by the three SDK notebooks (multi-workspace via SP OAuth M2M).
+│   ├── inventory_jobs.py              # Widgets + multi-workspace loop calling inventory_jobs.run(client=..., delta_table=...).
+│   ├── bulk_apply_webhooks.py         # Same pattern; adds scan_limit/name_filter widgets for the scan-perf knobs.
+│   ├── create_webhook_destination.py  # Same pattern; no Delta output.
+│   └── patch_bundle_yaml.py           # Single-workspace; reads/writes YAMLs in a Databricks Git folder.
 ├── tests/
-│   ├── test_inventory_jobs.py         # Classification + filters + CSV schema + end-to-end main() drive.
-│   ├── test_bulk_apply_webhooks.py    # Non-DAB and DAB job handling for the bulk script.
+│   ├── test_inventory_jobs.py         # Classification + filters + CSV schema + end-to-end main() drive + notebook-only kwargs (client/scan_limit/name_filter).
+│   ├── test_bulk_apply_webhooks.py    # Non-DAB and DAB job handling for the bulk script + notebook-only kwargs.
+│   ├── test_create_webhook_destination.py  # Idempotency + client-injection contract for the multi-workspace dispatcher.
 │   └── test_patch_bundle_yaml.py      # Base-resource patches + DAB caveats; ends with an integration
 │                                      # test that runs main() against a tmp-copy of examples/caveats.
 └── examples/
@@ -61,6 +68,10 @@ End-to-end validation against a real workspace is still manual via the `examples
 ## Code conventions
 
 - **Single-file CLIs.** Each script is one module with a `main() -> int` plus `if __name__ == "__main__": sys.exit(main())`. No package, no shared library, no cross-imports between the four scripts. Duplicated logic across files is intentional — `EVENT_FIELDS` / `parse_events` (in the bulk and patcher scripts), and `_dig` / `BundleMetadata` / `is_bundle_job` / `fetch_bundle_metadata` / `job_matches` / `Filters` (in the bulk and inventory scripts). Keep it that way unless the user asks for a shared module.
+- **Each script also exposes a `run(**kwargs)` callable.** `main()` is a thin shim over `run()` — it calls `run(**vars(parse_args()))`. The notebook layer imports `run()` directly. Kwargs split into two groups: CLI-shape kwargs (1:1 with `parse_args()`) and notebook-only kwargs (`client`, `spark`, `delta_table`, `scan_limit`, `name_filter`, `workspace_label`). The notebook-only kwargs default to None so CLI users get the existing behaviour. Keep `run()` signatures stable — notebook widgets map to them.
+- **`client` kwarg semantics.** When `run(client=...)` is passed a pre-built `WorkspaceClient`, `build_client()` MUST NOT be called. This is how the multi-workspace dispatcher in `notebooks/_auth.py` injects an SP-authed client per target workspace. Tests pin this — see `TestRunNotebookKwargs.test_client_kwarg_bypasses_build_client`.
+- **`scan_limit` vs `limit`.** `limit` is a CLI flag that caps **mutations** (jobs that would actually get updated). `scan_limit` is a notebook-only kwarg that caps the **workspace walk itself** (jobs scanned, regardless of matches). They're not interchangeable; the README "Scan performance" section explains the distinction. The transcript feedback (Riyaz @ 44:03) called out that `--limit` alone doesn't shorten a scan when matches are sparse — that's by design, and `scan_limit` is the fix.
+- **Notebook layer is allowed to share.** The "no shared module between the four scripts" invariant applies to the .py scripts. `notebooks/_auth.py` is a notebook-side helper that the three SDK notebooks import — that's allowed and intentional (the multi-workspace dispatcher is identical across notebooks).
 - **Argparse-only.** `parse_args()` is the single entry for CLI handling, with `RawDescriptionHelpFormatter` and the module docstring used as `description=`.
 - **Dataclasses for state.** `bulk_apply_webhooks.py` uses `@dataclass` for `Filters`, `Stats`, `BundleMetadata`, `BundleJobRecord`. Keep new state in dataclasses, not tuples or dicts.
 - **Logging, not print.** `logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s")`. INFO is the normal level; DEBUG is gated behind `-v`. The only `print` calls are in `create_webhook_destination.py`'s `print_summary` (user-visible result block).
@@ -104,6 +115,8 @@ A change to any of the four scripts should pass `pytest` AND be dry-run against 
 - When changing patcher logic, re-read the relevant caveat section in the README and update both the docstring and the README in the same change. The README is the user-facing contract.
 - Match the existing logging format and verbosity gating (`-v` → DEBUG).
 - For workspace/bundle-touching command sequences, hand the commands to the user to run — don't execute them via Bash yourself.
+- When changing `run()` kwargs in any of the three SDK scripts, update the corresponding notebook under `notebooks/` in the same change. The notebook layer is the contract the support team uses; drift between `run()` and the notebooks breaks them.
+- When changing the Delta-write schemas in `write_inventory_delta` / `write_bundle_report_delta`, update the README's "Output: Delta tables" section. The schema is part of the contract — downstream consumers SELECT specific columns.
 
 ## Never
 
@@ -112,5 +125,6 @@ A change to any of the four scripts should pass `pytest` AND be dry-run against 
 - Never swap `ruamel.yaml` for PyYAML or any non-round-trip YAML library. Comments, anchors, and quoting must survive.
 - Never auto-resolve `${var.*}` references in the patcher. Skip with WARNING is the correct behavior.
 - Never edit files under `.databricks/`, `bundle_jobs.csv`, or `jobs_inventory.csv` — they're runtime artifacts and are gitignored.
-- Never add a shared utility module between the four scripts unless the user asks for it. They are intentionally standalone, even when that means duplicating helpers like `is_bundle_job` / `fetch_bundle_metadata` between the bulk and inventory scripts.
+- Never add a shared utility module between the four scripts unless the user asks for it. They are intentionally standalone, even when that means duplicating helpers like `is_bundle_job` / `fetch_bundle_metadata` between the bulk and inventory scripts. (Note: `notebooks/_auth.py` is a separate notebook-layer helper — that's allowed and not what this rule is about.)
+- Never call `databricks bundle validate` or `databricks bundle deploy` from inside the patcher notebook. The PR-review gate is load-bearing — validate/deploy live in CI. The patcher notebook stops at "patched files + diff."
 - Never bypass `--apply` checks by short-circuiting in helper functions.

@@ -127,14 +127,14 @@ def setup_logging(verbose: bool) -> None:
     )
 
 
-def parse_filters(args: argparse.Namespace) -> Filters:
+def parse_filters(tag: Optional[str], owners: Optional[List[str]]) -> Filters:
     tag_key = tag_value = None
-    if args.tag:
-        if "=" in args.tag:
-            tag_key, tag_value = args.tag.split("=", 1)
+    if tag:
+        if "=" in tag:
+            tag_key, tag_value = tag.split("=", 1)
         else:
-            tag_key = args.tag
-    return Filters(tag_key=tag_key, tag_value=tag_value, owners=list(args.owner))
+            tag_key = tag
+    return Filters(tag_key=tag_key, tag_value=tag_value, owners=list(owners or []))
 
 
 def _dig(d, *keys):
@@ -222,6 +222,48 @@ def write_inventory(path: str, records: List[JobRecord]) -> None:
     logging.info("Wrote %d job records to %s", len(records), path)
 
 
+def write_inventory_delta(spark, table: str, records: List[JobRecord], workspace_label: str) -> None:
+    """Write records to a Delta table partitioned by workspace_host.
+
+    Per-workspace re-runs replace only that workspace's partition via dynamic
+    partition overwrite — `SELECT * FROM <table>` always reflects the latest
+    scan per workspace. Multi-workspace loops accumulate across partitions."""
+    if not records:
+        logging.info("No records to write to %s.", table)
+        return
+    import datetime
+    scanned_at = datetime.datetime.now(datetime.timezone.utc)
+    rows = []
+    for r in records:
+        md = r.metadata or BundleMetadata()
+        rows.append({
+            "workspace_host": workspace_label,
+            "scanned_at": scanned_at,
+            "job_id": r.job_id,
+            "name": r.name,
+            "creator": r.creator or "",
+            "deployment_kind": r.deployment_kind,
+            "bundle_name": md.bundle_name or "",
+            "target": md.target or "",
+            "git_origin": md.git_origin or "",
+            "git_branch": md.git_branch or "",
+            "git_commit": md.git_commit or "",
+            "workspace_root": md.workspace_root or "",
+            "workspace_file_path": md.workspace_file_path or "",
+            "metadata_file_path": r.metadata_file_path or "",
+        })
+    df = spark.createDataFrame(rows)
+    (df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("partitionOverwriteMode", "dynamic")
+        .option("mergeSchema", "true")
+        .partitionBy("workspace_host")
+        .saveAsTable(table))
+    logging.info("Wrote %d job records to Delta table %s (workspace_host=%s)",
+                 len(records), table, workspace_label)
+
+
 def print_summary(stats: Stats, top_n: int, enriched: bool) -> None:
     """Render the count breakdown to stdout. Logging goes to stderr so summary survives `| tee`."""
     bundle_pct = (stats.bundle / stats.total * 100) if stats.total else 0.0
@@ -248,30 +290,72 @@ def build_client(profile: Optional[str]) -> WorkspaceClient:
     return WorkspaceClient(profile=profile) if profile else WorkspaceClient()
 
 
-def main() -> int:
-    args = parse_args()
-    setup_logging(args.verbose)
+def run(
+    profile: Optional[str] = None,
+    tag: Optional[str] = None,
+    owner: Optional[List[str]] = None,
+    output: str = "jobs_inventory.csv",
+    enrich_bundles: bool = False,
+    top_n: int = 10,
+    progress_every: int = 500,
+    verbose: bool = False,
+    client=None,
+    spark=None,
+    delta_table: Optional[str] = None,
+    scan_limit: Optional[int] = None,
+    name_filter: Optional[str] = None,
+    workspace_label: Optional[str] = None,
+) -> int:
+    """Library entry point. Notebooks import this and map widgets → kwargs.
 
-    w = build_client(args.profile)
-    filters = parse_filters(args)
+    Kwargs mirror `parse_args()` 1:1 for the CLI shape; notebook-only kwargs
+    follow (`client`, `spark`, `delta_table`, `scan_limit`, `name_filter`,
+    `workspace_label`).
+
+    `client`: pre-built WorkspaceClient. When set, `profile` is ignored — used
+    by the multi-workspace dispatcher to inject an SP-authed client per target
+    workspace.
+    `delta_table` + `spark`: when both are set, the notebook layer writes a
+    Delta table partitioned by workspace_host instead of (or in addition to)
+    the CSV at `output`. CLI users leave both None.
+    `scan_limit`: hard cap on jobs scanned. Stops the workspace walk after N
+    jobs regardless of matches. Distinct from CLI `--limit` (a mutation cap
+    that doesn't apply here — inventory is read-only).
+    `name_filter`: forwarded to `w.jobs.list(name=...)` as a server-side
+    substring filter on job name. The Jobs API does not support server-side
+    filtering on tag or creator, so `name_filter` is the only way to cut the
+    scan size before iteration."""
+    setup_logging(verbose)
+
+    w = client if client is not None else build_client(profile)
+    filters = parse_filters(tag, owner)
     stats = Stats()
     records: List[JobRecord] = []
     bundle_meta_cache: Dict[str, Optional[BundleMetadata]] = {}
 
     logging.info(
-        "Scanning jobs host=%s tag=%s owners=%s enrich_bundles=%s",
+        "Scanning jobs host=%s tag=%s owners=%s enrich_bundles=%s name_filter=%s scan_limit=%s",
         w.config.host,
         f"{filters.tag_key}={filters.tag_value}" if filters.tag_key else None,
         filters.owners or None,
-        args.enrich_bundles,
+        enrich_bundles,
+        name_filter,
+        scan_limit,
     )
 
+    list_kwargs = {"expand_tasks": False}
+    if name_filter:
+        list_kwargs["name"] = name_filter
+
     scanned = 0
-    for job in w.jobs.list(expand_tasks=False):
+    for job in w.jobs.list(**list_kwargs):
         scanned += 1
-        if args.progress_every and scanned % args.progress_every == 0:
+        if progress_every and scanned % progress_every == 0:
             logging.info("...scanned=%d matched=%d bundle=%d direct=%d",
                          scanned, stats.total, stats.bundle, stats.direct)
+        if scan_limit is not None and scanned >= scan_limit:
+            logging.info("Reached scan_limit=%d, stopping scan.", scan_limit)
+            break
 
         if not job_matches(job, filters):
             continue
@@ -283,7 +367,7 @@ def main() -> int:
 
         if bundle:
             stats.bundle += 1
-            md = fetch_bundle_metadata(w, meta_path, bundle_meta_cache) if args.enrich_bundles else None
+            md = fetch_bundle_metadata(w, meta_path, bundle_meta_cache) if enrich_bundles else None
             if md and md.bundle_name:
                 stats.bundles_by_name[md.bundle_name] += 1
             records.append(JobRecord(
@@ -301,11 +385,20 @@ def main() -> int:
                 deployment_kind="DIRECT",
             ))
 
-    write_inventory(args.output, records)
-    print_summary(stats, args.top_n, args.enrich_bundles)
+    if delta_table:
+        if spark is None:
+            raise SystemExit("delta_table requires a `spark` kwarg (the notebook's SparkSession).")
+        write_inventory_delta(spark, delta_table, records, workspace_label or w.config.host)
+    if output:
+        write_inventory(output, records)
+    print_summary(stats, top_n, enrich_bundles)
     logging.info("Done. scanned=%d matched=%d bundle=%d direct=%d",
                  scanned, stats.total, stats.bundle, stats.direct)
     return 0
+
+
+def main() -> int:
+    return run(**vars(parse_args()))
 
 
 if __name__ == "__main__":

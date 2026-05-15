@@ -367,3 +367,24 @@ class TestCaveatsBundleEndToEnd:
         assert patcher.main() == 0
         after_second = (caveats_bundle / "resources" / "analytics.yml").read_text()
         assert after_first == after_second
+
+
+class TestRunCallable:
+    """Lock the run(**kwargs) contract that notebook widgets map to. The
+    patcher notebook calls patcher.run(bundle_dir=..., webhook_id=..., apply=...)
+    after reading widgets — that path must produce the same files-on-disk as
+    the equivalent CLI invocation."""
+
+    def test_run_apply_matches_cli(self, caveats_bundle):
+        rc = patcher.run(
+            bundle_dir=str(caveats_bundle),
+            webhook_id=WEBHOOK_ID,
+            apply=True,
+        )
+        assert rc == 0
+        analytics = (caveats_bundle / "resources" / "analytics.yml").read_text()
+        assert WEBHOOK_ID in analytics
+
+    def test_run_rejects_empty_webhook_id(self, caveats_bundle):
+        with pytest.raises(SystemExit, match="webhook_id is required"):
+            patcher.run(bundle_dir=str(caveats_bundle), webhook_id="")

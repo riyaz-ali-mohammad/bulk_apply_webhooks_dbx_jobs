@@ -107,6 +107,89 @@ databricks current-user me
 
 ---
 
+## Running as Databricks notebooks (multi-workspace via SP)
+
+The four scripts are also available as Databricks **source-format** notebooks
+under [`notebooks/`](notebooks/). The notebooks expose every CLI flag as a
+`dbutils.widgets` entry and add a multi-workspace dispatcher so one notebook can
+operate across many target workspaces. Designed for support teams that don't
+have the Databricks CLI installed.
+
+### Auth model
+A single Entra-ID service principal, registered as a Databricks-account-level
+service principal, is granted **workspace-admin** on each target workspace. The
+SP's OAuth `client_id` and `client_secret` live in a Databricks secret scope.
+The notebook reads them once and constructs one `WorkspaceClient` per target
+workspace URL.
+
+```python
+# What the dispatcher does under the hood (see notebooks/_auth.py)
+WorkspaceClient(host=url, client_id=<from secrets>, client_secret=<from secrets>)
+```
+
+Leave the `workspace_urls` widget empty to fall back to **notebook-auto-auth**
+against the current workspace — useful for one-off testing before secrets are
+wired up.
+
+### Output: Delta tables (not CSV)
+The notebook layer writes inventory output to a Delta table partitioned by
+`workspace_host`. Per-workspace re-runs replace only that workspace's partition
+(dynamic partition overwrite), so `SELECT * FROM <delta_table>` always reflects
+the latest scan across all workspaces.
+
+- `inventory_jobs` notebook → `delta_table` widget (default `main.webhook_rollout.jobs_inventory`)
+- `bulk_apply_webhooks` notebook → `delta_table` widget (bundle-managed jobs encountered; default `main.webhook_rollout.bundle_jobs`)
+- `create_webhook_destination` and `patch_bundle_yaml` notebooks: no Delta output (no inventory to write)
+
+CSV output stays available in the CLI (`--output`, `--bundle-report`); the
+notebook layer disables it by default.
+
+### Scan performance
+The Databricks Jobs API does not support server-side filtering on tag or creator,
+so tag-filtered walks must iterate the full job list. Two widgets help here:
+
+- `name_filter` — forwarded to `w.jobs.list(name=...)`. The **only** filter the
+  Jobs API applies server-side. When the support team knows part of the job
+  name (e.g. `etl-`), this cuts scan time by orders of magnitude.
+- `scan_limit` — hard cap on jobs scanned regardless of matches. Distinct from
+  `limit` (which caps **mutations**). Use `scan_limit` for "touch only the
+  first N jobs the workspace returns" rollouts. **This is the right widget to
+  set if you saw `--limit 5` not shortening a scan in the CLI** — `--limit`
+  short-circuits only after N matches accumulate; with sparse matches and a
+  large workspace, the scan still walks the full list.
+
+### Set-up checklist for a new workspace cohort
+1. Register the Entra-ID SP as a Databricks-account service principal; issue
+   OAuth client_id + client_secret.
+2. Grant the SP **workspace-admin** on each target workspace (account console).
+3. Create a Databricks secret scope (e.g. `webhook-rollout`) in the management
+   workspace and put `databricks_client_id` and `databricks_client_secret`
+   into it.
+4. Check out this repo as a Databricks Git folder in the management workspace.
+5. Open `notebooks/inventory_jobs` first (read-only). Fill widgets:
+   - `workspace_urls` = comma-separated target hosts
+   - `secret_scope` = `webhook-rollout`
+   - `delta_table` = e.g. `main.webhook_rollout.jobs_inventory`
+6. Run it. `SELECT * FROM main.webhook_rollout.jobs_inventory` should show one
+   row per job across all listed workspaces.
+7. Then `notebooks/create_webhook_destination` to provision the destination in
+   each workspace (apply=true once the dry-run looks right).
+8. Then `notebooks/bulk_apply_webhooks` to attach the destination to
+   directly-deployed jobs. Bundle-managed jobs are skipped by default and
+   listed in the `bundle_jobs` Delta table for owner follow-up.
+9. For bundle-managed jobs, owner clones the DAB repo as a Databricks Git
+   folder, opens `notebooks/patch_bundle_yaml`, runs dry-run, then apply.
+   Commits + pushes from the Repos UI; CI runs `databricks bundle validate`
+   and merge triggers `databricks bundle deploy`. The notebook **does not**
+   validate or deploy — that gate stays in PR/CI.
+
+### Patcher notebook caveats
+The patcher notebook is **single-workspace** (a DAB lives in one Git repo). It
+needs a Databricks Git folder containing the bundle, and the SP running the
+notebook needs Can Manage on that Git folder to write the YAMLs in place.
+
+---
+
 ## Inventory a workspace first (`inventory_jobs.py`)
 
 Before generating webhook IDs or touching jobs, get a clean picture of what's in the workspace. The inventory script is read-only and answers two questions in one pass:

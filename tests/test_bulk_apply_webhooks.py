@@ -588,3 +588,93 @@ class TestResolveRemoveJobIds:
         path.write_text("2\n3\n")
         args = _walk_args(job_id=[1, 2], job_ids_from=str(path))
         assert bulk._resolve_remove_job_ids(args) == [1, 2, 3]
+
+
+class TestRunCallable:
+    """Lock the run(**kwargs) contract that notebook widgets map to. The CLI's
+    post-parse cross-flag guards must also fire under run() — a notebook
+    caller should get the same SystemExit a CLI caller does."""
+
+    def test_run_requires_webhook_id_in_add_mode(self):
+        with pytest.raises(SystemExit, match="--webhook-id is required"):
+            bulk.run(webhook_id=None)
+
+    def test_run_remove_walk_requires_webhook_id(self):
+        with pytest.raises(SystemExit, match="workspace-walk mode and REQUIRES"):
+            bulk.run(remove=True)
+
+    def test_run_remove_rejects_filters_with_explicit_jobs(self):
+        with pytest.raises(SystemExit, match="don't combine"):
+            bulk.run(remove=True, webhook_id=WEBHOOK_ID, job_id=[1], tag="team=x")
+
+    def test_run_add_rejects_job_id(self):
+        with pytest.raises(SystemExit, match="only valid with --remove"):
+            bulk.run(webhook_id=WEBHOOK_ID, job_id=[1])
+
+    def test_run_kwargs_drive_add_path(self, monkeypatch):
+        w = MagicMock()
+        w.jobs.list.return_value = iter([_make_job(job_id=1, creator="alice@x.com")])
+        w.config.host = "https://test"
+        monkeypatch.setattr(bulk, "build_client", lambda profile: w)
+        rc = bulk.run(
+            webhook_id=WEBHOOK_ID,
+            owner=["alice@x.com"],
+            apply=False,
+            bundle_report="",
+            progress_every=0,
+        )
+        assert rc == 0
+
+
+class TestRunNotebookKwargs:
+    """Lock the contract for the notebook-only kwargs that the multi-workspace
+    dispatcher relies on: `client`, `scan_limit`, `name_filter`."""
+
+    def test_client_kwarg_bypasses_build_client(self, monkeypatch):
+        """When `client` is passed, build_client must not be called. This is
+        how the multi-workspace dispatcher injects SP-authed clients."""
+        w = MagicMock()
+        w.jobs.list.return_value = iter([])
+        w.config.host = "https://injected"
+
+        def _should_not_be_called(profile):
+            raise AssertionError("build_client must not be invoked when client= is provided")
+        monkeypatch.setattr(bulk, "build_client", _should_not_be_called)
+
+        rc = bulk.run(client=w, webhook_id=WEBHOOK_ID, bundle_report="", progress_every=0)
+        assert rc == 0
+
+    def test_scan_limit_short_circuits_walk(self, monkeypatch):
+        """scan_limit caps the walk regardless of matches. The transcript
+        feedback (Riyaz @ 44:03, Santosh @ 41:08) calls out that --limit alone
+        doesn't shorten the scan when matches are sparse; scan_limit fixes that."""
+        consumed = []
+        def gen():
+            for i in range(20):
+                consumed.append(i)
+                yield _make_job(job_id=i, creator="nobody@x.com")
+        w = MagicMock()
+        w.jobs.list.return_value = gen()
+        w.config.host = "https://test"
+        monkeypatch.setattr(bulk, "build_client", lambda profile: w)
+
+        bulk.run(
+            webhook_id=WEBHOOK_ID,
+            owner=["alice@x.com"],  # no jobs match
+            scan_limit=5,
+            bundle_report="",
+            progress_every=0,
+        )
+        assert len(consumed) == 5, f"scan_limit=5 must stop at 5 jobs consumed, got {len(consumed)}"
+
+    def test_name_filter_forwarded_to_jobs_list(self, monkeypatch):
+        """name_filter → w.jobs.list(name=...) — the only filter the Jobs API
+        supports server-side, so this is the only way to cut the scan size
+        before iteration."""
+        w = MagicMock()
+        w.jobs.list.return_value = iter([])
+        w.config.host = "https://test"
+        monkeypatch.setattr(bulk, "build_client", lambda profile: w)
+
+        bulk.run(webhook_id=WEBHOOK_ID, name_filter="etl-", bundle_report="", progress_every=0)
+        w.jobs.list.assert_called_with(expand_tasks=False, name="etl-")

@@ -261,3 +261,99 @@ class TestMainEndToEnd:
         monkeypatch.chdir(tmp_path)
         assert inv.main() == 0
         assert not out_path.exists()
+
+
+class TestRunCallable:
+    """Lock the run(**kwargs) contract that notebook widgets map to. If a
+    notebook calls inv.run(...) with the documented kwargs, the script must
+    behave the same as the equivalent CLI invocation."""
+
+    def test_run_kwargs_match_cli_behaviour(self, tmp_path, monkeypatch, capsys):
+        jobs = [
+            _make_job(job_id=1, creator="alice@x.com"),
+            _make_job(job_id=2, creator="bob@x.com"),
+        ]
+        w = MagicMock()
+        w.jobs.list.return_value = iter(jobs)
+        w.config.host = "https://test"
+        monkeypatch.setattr(inv, "build_client", lambda profile: w)
+
+        out_path = tmp_path / "inv.csv"
+        rc = inv.run(
+            profile=None,
+            tag=None,
+            owner=["alice@x.com"],
+            output=str(out_path),
+            enrich_bundles=False,
+            top_n=0,
+            progress_every=0,
+            verbose=False,
+        )
+        assert rc == 0
+        rows = list(csv.reader(out_path.read_text().splitlines()))
+        assert len(rows) == 2  # header + alice only
+        out = capsys.readouterr().out
+        assert "total:           1" in out
+
+
+class TestRunNotebookKwargs:
+    """The notebook-only kwargs (`client`, `scan_limit`, `name_filter`) are the
+    contract the multi-workspace dispatcher in notebooks/_auth.py depends on.
+    These tests prove the script honors them; the notebook layer is then a
+    thin wrapper around this behaviour."""
+
+    def test_client_kwarg_bypasses_build_client(self, tmp_path, monkeypatch, capsys):
+        """When `client` is passed, run() must NOT call build_client(). This
+        is how the multi-workspace dispatcher injects a per-workspace SP-authed
+        client; if build_client got called instead, every iteration would
+        re-resolve the wrong identity."""
+        w = MagicMock()
+        w.jobs.list.return_value = iter([_make_job(job_id=1)])
+        w.config.host = "https://injected"
+
+        def _should_not_be_called(profile):
+            raise AssertionError("build_client must not be invoked when client= is provided")
+        monkeypatch.setattr(inv, "build_client", _should_not_be_called)
+
+        rc = inv.run(client=w, output="", top_n=0, progress_every=0)
+        assert rc == 0
+
+    def test_scan_limit_stops_walk_before_full_iteration(self, monkeypatch):
+        """scan_limit caps stats.scanned regardless of matches. Distinct from
+        the CLI's --limit (a mutation cap, not applicable to read-only inventory).
+        Use a generator to prove the loop short-circuits before consuming all items."""
+        consumed = []
+        def gen():
+            for i in range(10):
+                consumed.append(i)
+                yield _make_job(job_id=i, creator="nobody@x.com")
+        w = MagicMock()
+        w.jobs.list.return_value = gen()
+        w.config.host = "https://test"
+        monkeypatch.setattr(inv, "build_client", lambda profile: w)
+
+        inv.run(owner=["alice@x.com"], scan_limit=3, output="", top_n=0, progress_every=0)
+        assert len(consumed) == 3, f"scan_limit=3 should stop at 3 jobs consumed, got {len(consumed)}"
+
+    def test_name_filter_passed_to_jobs_list(self, monkeypatch):
+        """name_filter must be forwarded to w.jobs.list(name=...) — that's
+        the only server-side filter the Jobs API supports."""
+        w = MagicMock()
+        w.jobs.list.return_value = iter([])
+        w.config.host = "https://test"
+        monkeypatch.setattr(inv, "build_client", lambda profile: w)
+
+        inv.run(name_filter="etl-prefix", output="", top_n=0, progress_every=0)
+        # Verify list() was called with name= kwarg
+        w.jobs.list.assert_called_with(expand_tasks=False, name="etl-prefix")
+
+    def test_no_name_filter_omits_name_kwarg(self, monkeypatch):
+        """When name_filter is None, the `name` kwarg must NOT be passed to
+        jobs.list() — the SDK treats `name=None` differently from absent."""
+        w = MagicMock()
+        w.jobs.list.return_value = iter([])
+        w.config.host = "https://test"
+        monkeypatch.setattr(inv, "build_client", lambda profile: w)
+
+        inv.run(output="", top_n=0, progress_every=0)
+        w.jobs.list.assert_called_with(expand_tasks=False)

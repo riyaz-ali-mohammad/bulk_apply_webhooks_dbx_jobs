@@ -228,30 +228,47 @@ def dump_to_string(yaml: YAML, doc) -> str:
     return buf.getvalue()
 
 
-def main() -> int:
-    args = parse_args()
+def run(
+    bundle_dir: str = ".",
+    webhook_id: str = "",
+    events: str = "on_failure,on_duration_warning_threshold_exceeded",
+    job: Optional[List[str]] = None,
+    tag: Optional[str] = None,
+    apply: bool = False,
+    verbose: bool = False,
+) -> int:
+    """Library entry point. Notebooks import this and map widgets → kwargs.
+
+    Kwargs mirror `parse_args()` 1:1 so that `main()` is a thin shim and the
+    notebook layer has a single, stable contract.
+
+    `webhook_id` is required (the CLI enforces `required=True` via argparse).
+    `job` is the repeatable `--job` filter; `tag` is the raw `key=value` string."""
+    if not webhook_id:
+        raise SystemExit("webhook_id is required.")
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    bundle_dir = Path(args.bundle_dir).resolve()
-    root_yaml = bundle_dir / "databricks.yml"
+    bundle_dir_path = Path(bundle_dir).resolve()
+    root_yaml = bundle_dir_path / "databricks.yml"
     if not root_yaml.exists():
-        raise SystemExit(f"No databricks.yml found at {root_yaml}. Pass --bundle-dir.")
+        raise SystemExit(f"No databricks.yml found at {root_yaml}. Pass bundle_dir.")
 
-    events = parse_events(args.events)
-    tag = parse_tag_filter(args.tag)
+    parsed_events = parse_events(events)
+    parsed_tag = parse_tag_filter(tag)
+    job_names = list(job or [])
     yaml = make_yaml()
 
     with root_yaml.open() as f:
         root_doc = yaml.load(f)
-    files = discover_yaml_files(bundle_dir, root_doc)
+    files = discover_yaml_files(bundle_dir_path, root_doc)
 
     logging.info(
         "Mode=%s bundle_dir=%s files=%d events=%s job_filter=%s tag=%s",
-        "APPLY" if args.apply else "DRY-RUN",
-        bundle_dir, len(files), events, args.job or None, args.tag,
+        "APPLY" if apply else "DRY-RUN",
+        bundle_dir_path, len(files), parsed_events, job_names or None, tag,
     )
 
     total_files_changed = 0
@@ -281,63 +298,67 @@ def main() -> int:
                 # target. If the override already contains the same webhook_id
                 # the patcher would add to the base, we'd still hit a duplicate
                 # at deploy via concatenation, so warn loudly.
-                dup_events = _override_dup_events(jnode, args.webhook_id, events)
+                dup_events = _override_dup_events(jnode, webhook_id, parsed_events)
                 if dup_events:
                     logging.warning(
                         "  %s :: %s -> override already contains webhook %s on events %s. "
                         "DAB merge will concatenate base + override at deploy, producing "
                         "duplicates that Databricks rejects. Hand-edit the override to "
                         "remove the redundant entries before `bundle deploy`.",
-                        path.relative_to(bundle_dir), loc, args.webhook_id, dup_events,
+                        path.relative_to(bundle_dir_path), loc, webhook_id, dup_events,
                     )
                 else:
                     logging.info(
                         "  %s :: %s -> skipped (target override; DAB merge propagates base patch)",
-                        path.relative_to(bundle_dir), loc,
+                        path.relative_to(bundle_dir_path), loc,
                     )
                 continue
-            if not job_matches(jnode, args.job, tag):
+            if not job_matches(jnode, job_names, parsed_tag):
                 continue
             total_jobs_matched += 1
-            patched, var_skipped = patch_webhooks(jnode, args.webhook_id, events)
+            patched, var_skipped = patch_webhooks(jnode, webhook_id, parsed_events)
             if patched:
                 total_jobs_patched += 1
                 file_changed = True
-                logging.info("  %s :: %s -> patched", path.relative_to(bundle_dir), loc)
+                logging.info("  %s :: %s -> patched", path.relative_to(bundle_dir_path), loc)
             else:
-                logging.debug("  %s :: %s -> already has webhook", path.relative_to(bundle_dir), loc)
+                logging.debug("  %s :: %s -> already has webhook", path.relative_to(bundle_dir_path), loc)
             if var_skipped:
                 total_var_skipped_events += len(var_skipped)
                 logging.warning(
                     "  %s :: %s -> events %s skipped: existing ${var.*} reference. "
                     "Patcher writes literal IDs; if the variable resolves to the same destination, "
                     "Databricks rejects the deploy with 'Duplicate webhook ids'. Hand-edit if needed.",
-                    path.relative_to(bundle_dir), loc, var_skipped,
+                    path.relative_to(bundle_dir_path), loc, var_skipped,
                 )
 
         if not file_changed:
             continue
         total_files_changed += 1
         new_content = dump_to_string(yaml, doc)
-        if args.apply:
+        if apply:
             with path.open("w") as f:
                 f.write(new_content)
-            logging.info("Wrote %s", path.relative_to(bundle_dir))
+            logging.info("Wrote %s", path.relative_to(bundle_dir_path))
         else:
             sys.stdout.writelines(difflib.unified_diff(
                 original.splitlines(keepends=True),
                 new_content.splitlines(keepends=True),
-                fromfile=f"a/{path.relative_to(bundle_dir)}",
-                tofile=f"b/{path.relative_to(bundle_dir)}",
+                fromfile=f"a/{path.relative_to(bundle_dir_path)}",
+                tofile=f"b/{path.relative_to(bundle_dir_path)}",
             ))
 
     logging.info(
         "Done. mode=%s files_changed=%d jobs_seen=%d jobs_matched=%d jobs_patched=%d overrides_skipped=%d var_skipped_events=%d",
-        "APPLY" if args.apply else "DRY-RUN",
+        "APPLY" if apply else "DRY-RUN",
         total_files_changed, total_jobs_seen, total_jobs_matched, total_jobs_patched,
         total_overrides_skipped, total_var_skipped_events,
     )
     return 0
+
+
+def main() -> int:
+    return run(**vars(parse_args()))
 
 
 if __name__ == "__main__":

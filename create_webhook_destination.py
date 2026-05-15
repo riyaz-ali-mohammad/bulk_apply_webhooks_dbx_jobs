@@ -18,6 +18,7 @@ Examples:
 import argparse
 import logging
 import sys
+from typing import Optional
 from urllib.parse import urlparse
 
 from databricks.sdk import WorkspaceClient
@@ -59,34 +60,52 @@ def print_summary(label: str, dest) -> None:
     print(f"  url:          {url}")
 
 
-def main() -> int:
-    args = parse_args()
+def run(
+    url: str,
+    name: str,
+    apply: bool = False,
+    profile: Optional[str] = None,
+    verbose: bool = False,
+    client=None,
+) -> int:
+    """Library entry point. Notebooks import this and map widgets → kwargs.
+
+    Kwargs mirror `parse_args()` 1:1 for the CLI shape; `client` is a notebook-
+    only kwarg that lets the multi-workspace dispatcher inject a pre-built
+    `WorkspaceClient` per target workspace (replacing the `profile` lookup)."""
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         stream=sys.stderr,
     )
-    validate_url(args.url)
+    validate_url(url)
 
-    w = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
-    logging.info("Mode=%s host=%s name=%s", "APPLY" if args.apply else "DRY-RUN", w.config.host, args.name)
+    if client is not None:
+        w = client
+    else:
+        w = WorkspaceClient(profile=profile) if profile else WorkspaceClient()
+    logging.info("Mode=%s host=%s name=%s", "APPLY" if apply else "DRY-RUN", w.config.host, name)
 
-    existing = find_existing(w, args.name)
+    existing = find_existing(w, name)
     if existing is not None:
-        print_summary(f"Destination already exists with display_name={args.name!r}:", existing)
+        print_summary(f"Destination already exists with display_name={name!r}:", existing)
         return 0
 
-    if not args.apply:
-        logging.info("DRY-RUN: would create a generic-webhook destination named %r pointing at %s", args.name, args.url)
-        logging.info("Re-run with --apply to actually create it.")
+    if not apply:
+        logging.info("DRY-RUN: would create a generic-webhook destination named %r pointing at %s", name, url)
+        logging.info("Re-run with apply=True to actually create it.")
         return 0
 
     dest = w.notification_destinations.create(
-        display_name=args.name,
-        config=Config(generic_webhook=GenericWebhookConfig(url=args.url)),
+        display_name=name,
+        config=Config(generic_webhook=GenericWebhookConfig(url=url)),
     )
     print_summary("Created:", dest)
     return 0
+
+
+def main() -> int:
+    return run(**vars(parse_args()))
 
 
 if __name__ == "__main__":

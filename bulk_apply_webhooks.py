@@ -324,6 +324,45 @@ def write_bundle_report(path: str, records: List[BundleJobRecord]) -> None:
     logging.info("Wrote %d bundle-job records to %s", len(records), path)
 
 
+def write_bundle_report_delta(spark, table: str, records: List[BundleJobRecord], workspace_label: str) -> None:
+    """Write bundle-job records to a Delta table partitioned by workspace_host.
+    Per-workspace re-runs replace only that workspace's partition. See the
+    matching helper in inventory_jobs.py for partition-overwrite rationale."""
+    if not records:
+        logging.info("No bundle records to write to %s.", table)
+        return
+    import datetime
+    scanned_at = datetime.datetime.now(datetime.timezone.utc)
+    rows = []
+    for r in records:
+        md = r.metadata or BundleMetadata()
+        rows.append({
+            "workspace_host": workspace_label,
+            "scanned_at": scanned_at,
+            "job_id": r.job_id,
+            "name": r.name,
+            "creator": r.creator or "",
+            "bundle_name": md.bundle_name or "",
+            "target": md.target or "",
+            "git_origin": md.git_origin or "",
+            "git_branch": md.git_branch or "",
+            "git_commit": md.git_commit or "",
+            "workspace_root": md.workspace_root or "",
+            "workspace_file_path": md.workspace_file_path or "",
+            "metadata_file_path": r.metadata_file_path or "",
+        })
+    df = spark.createDataFrame(rows)
+    (df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("partitionOverwriteMode", "dynamic")
+        .option("mergeSchema", "true")
+        .partitionBy("workspace_host")
+        .saveAsTable(table))
+    logging.info("Wrote %d bundle-job records to Delta table %s (workspace_host=%s)",
+                 len(records), table, workspace_label)
+
+
 def job_matches(job: BaseJob, f: Filters) -> bool:
     if f.owners and (job.creator_user_name or "") not in f.owners:
         return False
@@ -636,23 +675,34 @@ def run_remove_walk_mode(args: argparse.Namespace, w: WorkspaceClient, stats: St
     bundle_records: List[BundleJobRecord] = []
     bundle_meta_cache: Dict[str, Optional[BundleMetadata]] = {}
 
+    scan_limit = getattr(args, "scan_limit", None)
+    name_filter = getattr(args, "name_filter", None)
     logging.info(
-        "Mode=%s op=REMOVE-WALK webhook=%s tag=%s owners=%s bundle_jobs=%s limit=%s",
+        "Mode=%s op=REMOVE-WALK webhook=%s tag=%s owners=%s bundle_jobs=%s limit=%s scan_limit=%s name_filter=%s",
         "APPLY" if args.apply else "DRY-RUN",
         args.webhook_id,
         f"{filters.tag_key}={filters.tag_value}" if filters.tag_key else None,
         filters.owners or None,
         args.bundle_jobs,
         args.limit,
+        scan_limit,
+        name_filter,
     )
 
-    for job in w.jobs.list(expand_tasks=False):
+    list_kwargs = {"expand_tasks": False}
+    if name_filter:
+        list_kwargs["name"] = name_filter
+
+    for job in w.jobs.list(**list_kwargs):
         stats.scanned += 1
         if args.progress_every and stats.scanned % args.progress_every == 0:
             logging.info(
                 "...scanned=%d matched=%d would_update=%d updated=%d bundle_skipped=%d",
                 stats.scanned, stats.matched, stats.would_update, stats.updated, stats.bundle_skipped,
             )
+        if scan_limit is not None and stats.scanned >= scan_limit:
+            logging.info("Reached scan_limit=%d, stopping scan.", scan_limit)
+            break
         if not job_matches(job, filters):
             continue
         stats.matched += 1
@@ -699,7 +749,15 @@ def run_remove_walk_mode(args: argparse.Namespace, w: WorkspaceClient, stats: St
             logging.info("Reached --limit=%d, stopping.", args.limit)
             break
 
-    write_bundle_report(args.bundle_report, bundle_records)
+    delta_table = getattr(args, "delta_table", None)
+    spark = getattr(args, "spark", None)
+    workspace_label = getattr(args, "workspace_label", None) or w.config.host
+    if delta_table:
+        if spark is None:
+            raise SystemExit("delta_table requires a `spark` kwarg (the notebook's SparkSession).")
+        write_bundle_report_delta(spark, delta_table, bundle_records, workspace_label)
+    if args.bundle_report:
+        write_bundle_report(args.bundle_report, bundle_records)
 
     logging.info(
         "Done. op=REMOVE-WALK scanned=%d matched=%d nothing_to_remove=%d bundle_skipped=%d "
@@ -710,11 +768,98 @@ def run_remove_walk_mode(args: argparse.Namespace, w: WorkspaceClient, stats: St
     return 1 if stats.errored else 0
 
 
-def main() -> int:
-    args = parse_args()
+def _validate_run_kwargs(args: argparse.Namespace) -> None:
+    """Re-implement the CLI's post-parse cross-flag validation so that notebook
+    callers fail the same way the CLI does. argparse's `p.error` is the source
+    of truth at [parse_args()] — keep these checks in sync."""
+    if args.remove:
+        has_explicit_jobs = bool(args.job_id) or bool(args.job_ids_from)
+        has_filters = bool(args.tag) or bool(args.owner)
+        if has_explicit_jobs and has_filters:
+            raise SystemExit(
+                "--tag/--owner filter the workspace walk; they don't combine with "
+                "explicit --job-id/--job-ids-from. Drop the filters, or drop the explicit job list."
+            )
+        if not has_explicit_jobs and not args.webhook_id:
+            raise SystemExit(
+                "--remove without --job-id/--job-ids-from is workspace-walk mode and REQUIRES "
+                "--webhook-id (refusing to clear every webhook in the workspace from one CLI call)."
+            )
+    else:
+        if not args.webhook_id:
+            raise SystemExit("--webhook-id is required (unless using --remove).")
+        if args.job_id or args.job_ids_from:
+            raise SystemExit(
+                "--job-id/--job-ids-from is only valid with --remove. "
+                "In add mode, use --tag/--owner filters."
+            )
+
+
+def run(
+    webhook_id: Optional[str] = None,
+    remove: bool = False,
+    job_id: Optional[List[int]] = None,
+    job_ids_from: Optional[str] = None,
+    events: str = "on_failure,on_duration_warning_threshold_exceeded",
+    tag: Optional[str] = None,
+    owner: Optional[List[str]] = None,
+    bundle_jobs: str = "skip",
+    bundle_report: str = "bundle_jobs.csv",
+    apply: bool = False,
+    profile: Optional[str] = None,
+    max_retries: int = 5,
+    base_sleep: float = 0.3,
+    jitter: float = 0.4,
+    limit: Optional[int] = None,
+    progress_every: int = 500,
+    verbose: bool = False,
+    client=None,
+    spark=None,
+    delta_table: Optional[str] = None,
+    scan_limit: Optional[int] = None,
+    name_filter: Optional[str] = None,
+    workspace_label: Optional[str] = None,
+) -> int:
+    """Library entry point. Notebooks import this and map widgets → kwargs.
+
+    Kwargs mirror `parse_args()` 1:1 for the CLI shape; notebook-only kwargs
+    follow (`client`, `spark`, `delta_table`, `scan_limit`, `name_filter`,
+    `workspace_label`). See the docstring on `inventory_jobs.run` for the
+    semantics — they match.
+
+    `limit` (mutation cap) and `scan_limit` (scan cap) are distinct: `limit`
+    stops the loop once N jobs would-update / updated; `scan_limit` stops the
+    walk after N jobs scanned regardless of matches. When matches are sparse,
+    `limit` alone won't shorten the scan — set `scan_limit` for that."""
+    args = argparse.Namespace(
+        webhook_id=webhook_id,
+        remove=remove,
+        job_id=list(job_id or []),
+        job_ids_from=job_ids_from,
+        events=events,
+        tag=tag,
+        owner=list(owner or []),
+        bundle_jobs=bundle_jobs,
+        bundle_report=bundle_report,
+        apply=apply,
+        profile=profile,
+        max_retries=max_retries,
+        base_sleep=base_sleep,
+        jitter=jitter,
+        limit=limit,
+        progress_every=progress_every,
+        verbose=verbose,
+        scan_limit=scan_limit,
+        name_filter=name_filter,
+        delta_table=delta_table,
+        spark=spark,
+        workspace_label=workspace_label,
+    )
+    _validate_run_kwargs(args)
     setup_logging(args.verbose)
 
-    w = build_client(args.profile)
+    w = client if client is not None else build_client(args.profile)
+    args.workspace_label = args.workspace_label or w.config.host
     stats = Stats()
 
     if args.remove:
@@ -722,28 +867,37 @@ def main() -> int:
             return run_remove_mode(args, w, stats)
         return run_remove_walk_mode(args, w, stats)
 
-    events = parse_events(args.events)
+    parsed_events = parse_events(args.events)
     filters = parse_filters(args)
     bundle_records: List[BundleJobRecord] = []
     bundle_meta_cache: Dict[str, Optional[BundleMetadata]] = {}
 
     logging.info(
-        "Mode=%s webhook=%s events=%s tag=%s owners=%s bundle_jobs=%s limit=%s",
+        "Mode=%s webhook=%s events=%s tag=%s owners=%s bundle_jobs=%s limit=%s scan_limit=%s name_filter=%s",
         "APPLY" if args.apply else "DRY-RUN",
-        args.webhook_id, events,
+        args.webhook_id, parsed_events,
         f"{filters.tag_key}={filters.tag_value}" if filters.tag_key else None,
         filters.owners or None,
         args.bundle_jobs,
         args.limit,
+        args.scan_limit,
+        args.name_filter,
     )
 
-    for job in w.jobs.list(expand_tasks=False):
+    list_kwargs = {"expand_tasks": False}
+    if args.name_filter:
+        list_kwargs["name"] = args.name_filter
+
+    for job in w.jobs.list(**list_kwargs):
         stats.scanned += 1
         if args.progress_every and stats.scanned % args.progress_every == 0:
             logging.info(
                 "...scanned=%d matched=%d would_update=%d updated=%d bundle_skipped=%d",
                 stats.scanned, stats.matched, stats.would_update, stats.updated, stats.bundle_skipped,
             )
+        if args.scan_limit is not None and stats.scanned >= args.scan_limit:
+            logging.info("Reached scan_limit=%d, stopping scan.", args.scan_limit)
+            break
         if not job_matches(job, filters):
             continue
         stats.matched += 1
@@ -768,7 +922,7 @@ def main() -> int:
                 logging.debug("Job %s (%s): skipping non-bundle job (--bundle-jobs=only).", job.job_id, name)
                 continue
 
-        process_job(w, job, args.webhook_id, events, args.apply, args.max_retries, stats)
+        process_job(w, job, args.webhook_id, parsed_events, args.apply, args.max_retries, stats)
 
         if args.apply:
             time.sleep(args.base_sleep + random.uniform(0, args.jitter))
@@ -777,7 +931,12 @@ def main() -> int:
             logging.info("Reached --limit=%d, stopping.", args.limit)
             break
 
-    write_bundle_report(args.bundle_report, bundle_records)
+    if args.delta_table:
+        if args.spark is None:
+            raise SystemExit("delta_table requires a `spark` kwarg (the notebook's SparkSession).")
+        write_bundle_report_delta(args.spark, args.delta_table, bundle_records, args.workspace_label)
+    if args.bundle_report:
+        write_bundle_report(args.bundle_report, bundle_records)
 
     logging.info(
         "Done. scanned=%d matched=%d already_attached=%d bundle_skipped=%d would_update=%d updated=%d errored=%d bundle_total=%d",
@@ -785,6 +944,10 @@ def main() -> int:
         stats.would_update, stats.updated, stats.errored, len(bundle_records),
     )
     return 1 if stats.errored else 0
+
+
+def main() -> int:
+    return run(**vars(parse_args()))
 
 
 if __name__ == "__main__":
