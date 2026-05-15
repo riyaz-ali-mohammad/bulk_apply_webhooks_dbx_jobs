@@ -8,7 +8,7 @@
 # MAGIC to actually create.
 # MAGIC
 # MAGIC ## Multi-workspace + SP auth
-# MAGIC Loops over `workspace_urls` and creates the same destination (same name +
+# MAGIC Loops over `WORKSPACE_URLS` and creates the same destination (same name +
 # MAGIC URL) in each, authenticated as the global Entra-ID SP whose credentials
 # MAGIC live in a Databricks secret scope. The SP must have **account-admin** for
 # MAGIC notification destinations on each target workspace.
@@ -22,6 +22,11 @@
 # MAGIC %md
 # MAGIC No `%pip install` needed — this notebook only imports `databricks-sdk`,
 # MAGIC which is pre-installed in the Databricks runtime.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Widgets
 
 # COMMAND ----------
 
@@ -47,6 +52,64 @@ WORKSPACE_URLS = [
     # "https://adb-1234567890123456.7.azuredatabricks.net",
     # "https://adb-9876543210987654.4.azuredatabricks.net",
 ]
+for u in WORKSPACE_URLS:
+    print(u)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Read widget values
+# MAGIC All `dbutils.widgets.get(...)` calls happen here so you can see in one
+# MAGIC place what's being passed into the run.
+
+# COMMAND ----------
+
+secret_scope = dbutils.widgets.get("secret_scope").strip()
+url = dbutils.widgets.get("url").strip()
+name = dbutils.widgets.get("name").strip()
+apply_flag = dbutils.widgets.get("apply")
+
+# COMMAND ----------
+
+print(f"secret_scope: {secret_scope!r}")
+print(f"url:          {url!r}")
+print(f"name:         {name!r}")
+print(f"apply:        {apply_flag!r}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Hardcoded secret keys
+# MAGIC Team convention. Edit if your scope uses different names.
+
+# COMMAND ----------
+
+SP_CLIENT_ID_KEY = "databricks_client_id"
+SP_CLIENT_SECRET_KEY = "databricks_client_secret"
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### Preflight: verify the scope has the keys we expect
+# MAGIC Skipped when `WORKSPACE_URLS` is empty — in that case the notebook falls
+# MAGIC back to notebook-auto-auth and doesn't need the secret scope.
+
+# COMMAND ----------
+
+if WORKSPACE_URLS:
+    present = {k.key for k in dbutils.secrets.list(secret_scope)}
+    for required in (SP_CLIENT_ID_KEY, SP_CLIENT_SECRET_KEY):
+        if required not in present:
+            raise SystemExit(
+                f"Secret scope {secret_scope!r} is missing key {required!r}. "
+                f"Keys present: {sorted(present)}. "
+                f"Edit SP_CLIENT_ID_KEY / SP_CLIENT_SECRET_KEY in this notebook "
+                f"if your scope uses different names."
+            )
+    print(f"Secret scope {secret_scope!r} OK — keys present: {sorted(present)}")
+else:
+    print("WORKSPACE_URLS empty — skipping secret-scope preflight "
+          "(notebook-auto-auth will be used).")
 
 # COMMAND ----------
 
@@ -65,14 +128,10 @@ for p in (repo_root, notebooks_dir):
 import create_webhook_destination
 import _auth
 
-# Hardcoded secret keys — team convention. Edit if your scope uses different names.
-SP_CLIENT_ID_KEY = "databricks_client_id"
-SP_CLIENT_SECRET_KEY = "databricks_client_secret"
-
 shared_kwargs = dict(
-    url=dbutils.widgets.get("url").strip(),
-    name=dbutils.widgets.get("name").strip(),
-    apply=dbutils.widgets.get("apply") == "true",
+    url=url,
+    name=name,
+    apply=apply_flag == "true",
     profile=None,
     verbose=False,
 )
@@ -81,7 +140,7 @@ if not shared_kwargs["url"] or not shared_kwargs["name"]:
 
 clients = _auth.build_clients(
     workspace_urls=[u.strip().rstrip("/") for u in WORKSPACE_URLS if u and u.strip()],
-    secret_scope=dbutils.widgets.get("secret_scope").strip() or None,
+    secret_scope=secret_scope or None,
     client_id_key=SP_CLIENT_ID_KEY,
     client_secret_key=SP_CLIENT_SECRET_KEY,
     dbutils=dbutils,
