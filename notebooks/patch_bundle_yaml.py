@@ -51,7 +51,6 @@ dbutils.widgets.text(
 dbutils.widgets.text("job", "", "filter by job `name:` field (comma-separated)")
 dbutils.widgets.text("tag", "", "filter by job-resource tag (key=value or key)")
 dbutils.widgets.dropdown("apply", "false", ["false", "true"], "write files in place (vs dry-run diff)")
-dbutils.widgets.dropdown("verbose", "false", ["false", "true"], "DEBUG logging")
 
 # COMMAND ----------
 
@@ -75,7 +74,7 @@ kwargs = dict(
     job=[j.strip() for j in job_raw.split(",") if j.strip()] if job_raw else [],
     tag=dbutils.widgets.get("tag").strip() or None,
     apply=dbutils.widgets.get("apply") == "true",
-    verbose=dbutils.widgets.get("verbose") == "true",
+    verbose=False,
 )
 print("Calling patch_bundle_yaml.run with:", kwargs)
 rc = patch_bundle_yaml.run(**kwargs)

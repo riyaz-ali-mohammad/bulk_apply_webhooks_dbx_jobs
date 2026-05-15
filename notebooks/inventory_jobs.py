@@ -41,16 +41,8 @@
 # COMMAND ----------
 
 # Authentication
-dbutils.widgets.text("workspace_urls", "",
-    "comma-separated target workspace URLs (empty = current workspace)")
 dbutils.widgets.text("secret_scope", "webhook-rollout",
     "Databricks secret scope holding SP credentials")
-dbutils.widgets.text("client_id_key", "databricks_client_id", "secret key for SP client_id")
-dbutils.widgets.text("client_secret_key", "databricks_client_secret", "secret key for SP client_secret")
-
-# Output
-dbutils.widgets.text("delta_table", "main.webhook_rollout.jobs_inventory",
-    "fully-qualified UC table name for the inventory")
 
 # Filters
 dbutils.widgets.text("tag", "", "tag filter (key=value or key)")
@@ -62,9 +54,33 @@ dbutils.widgets.dropdown("enrich_bundles", "false", ["false", "true"],
 dbutils.widgets.text("name_filter", "",
     "server-side substring filter on job name (forwarded to jobs.list)")
 dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap)")
-dbutils.widgets.text("progress_every", "500", "log progress every N jobs (0 disables)")
-dbutils.widgets.text("top_n", "10", "top-N bundles/creators in summary")
-dbutils.widgets.dropdown("verbose", "false", ["false", "true"], "DEBUG logging")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Target workspaces
+# MAGIC Edit the list below. One entry per target workspace URL. Leave the list
+# MAGIC empty (`WORKSPACE_URLS = []`) to fall back to notebook-auto-auth against
+# MAGIC the current workspace — handy for one-off testing before secrets are
+# MAGIC wired up.
+
+# COMMAND ----------
+
+WORKSPACE_URLS = [
+    # "https://adb-1234567890123456.7.azuredatabricks.net",
+    # "https://adb-9876543210987654.4.azuredatabricks.net",
+]
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Output destination
+# MAGIC Edit the fully-qualified UC table below before running. The SP must have
+# MAGIC `USE CATALOG`, `USE SCHEMA`, and `CREATE TABLE` on the target schema.
+
+# COMMAND ----------
+
+DELTA_TABLE = "main.webhook_rollout.jobs_inventory"
 
 # COMMAND ----------
 
@@ -83,6 +99,11 @@ for p in (repo_root, notebooks_dir):
 import inventory_jobs
 import _auth
 
+# Hardcoded secret keys — teams use these names by convention. If your scope
+# uses different keys, edit them here rather than adding more widgets.
+SP_CLIENT_ID_KEY = "databricks_client_id"
+SP_CLIENT_SECRET_KEY = "databricks_client_secret"
+
 
 def _optional_int(s: str):
     s = s.strip()
@@ -96,25 +117,24 @@ shared_kwargs = dict(
     owner=[o.strip() for o in owner_raw.split(",") if o.strip()] if owner_raw else [],
     output="",  # CSV disabled in notebook mode; Delta is the output
     enrich_bundles=dbutils.widgets.get("enrich_bundles") == "true",
-    top_n=int(dbutils.widgets.get("top_n")),
-    progress_every=int(dbutils.widgets.get("progress_every")),
-    verbose=dbutils.widgets.get("verbose") == "true",
+    top_n=10,
+    progress_every=500,
+    verbose=False,
     spark=spark,
-    delta_table=dbutils.widgets.get("delta_table").strip() or None,
+    delta_table=DELTA_TABLE,
     scan_limit=_optional_int(dbutils.widgets.get("scan_limit")),
     name_filter=dbutils.widgets.get("name_filter").strip() or None,
 )
 
-workspace_urls = _auth.parse_workspace_urls(dbutils.widgets.get("workspace_urls"))
 clients = _auth.build_clients(
-    workspace_urls=workspace_urls,
+    workspace_urls=[u.strip().rstrip("/") for u in WORKSPACE_URLS if u and u.strip()],
     secret_scope=dbutils.widgets.get("secret_scope").strip() or None,
-    client_id_key=dbutils.widgets.get("client_id_key").strip(),
-    client_secret_key=dbutils.widgets.get("client_secret_key").strip(),
+    client_id_key=SP_CLIENT_ID_KEY,
+    client_secret_key=SP_CLIENT_SECRET_KEY,
     dbutils=dbutils,
 )
 
-print(f"Inventorying {len(clients)} workspace(s) → {shared_kwargs['delta_table']}")
+print(f"Inventorying {len(clients)} workspace(s) → {DELTA_TABLE}")
 errors = []
 for w in clients:
     print(f"\n=== {w.config.host} ===")
@@ -131,4 +151,4 @@ if errors:
     for host, err in errors:
         print(f"  {host}: {err}")
     raise SystemExit(1)
-print(f"\nDone. SELECT * FROM {shared_kwargs['delta_table']}")
+print(f"\nDone. SELECT * FROM {DELTA_TABLE}")

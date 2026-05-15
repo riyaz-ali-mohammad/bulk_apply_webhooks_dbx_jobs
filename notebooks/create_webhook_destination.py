@@ -25,17 +25,27 @@
 # COMMAND ----------
 
 # Authentication
-dbutils.widgets.text("workspace_urls", "",
-    "comma-separated target workspace URLs (empty = current workspace)")
 dbutils.widgets.text("secret_scope", "webhook-rollout", "Databricks secret scope")
-dbutils.widgets.text("client_id_key", "databricks_client_id", "secret key for SP client_id")
-dbutils.widgets.text("client_secret_key", "databricks_client_secret", "secret key for SP client_secret")
 
 # Destination
 dbutils.widgets.text("url", "", "webhook URL (https://...)")
 dbutils.widgets.text("name", "", "destination display name (must be unique per workspace)")
 dbutils.widgets.dropdown("apply", "false", ["false", "true"], "actually create (vs dry-run)")
-dbutils.widgets.dropdown("verbose", "false", ["false", "true"], "DEBUG logging")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Target workspaces
+# MAGIC Edit the list below. One entry per target workspace URL. Leave the list
+# MAGIC empty (`WORKSPACE_URLS = []`) to fall back to notebook-auto-auth against
+# MAGIC the current workspace.
+
+# COMMAND ----------
+
+WORKSPACE_URLS = [
+    # "https://adb-1234567890123456.7.azuredatabricks.net",
+    # "https://adb-9876543210987654.4.azuredatabricks.net",
+]
 
 # COMMAND ----------
 
@@ -54,22 +64,25 @@ for p in (repo_root, notebooks_dir):
 import create_webhook_destination
 import _auth
 
+# Hardcoded secret keys — team convention. Edit if your scope uses different names.
+SP_CLIENT_ID_KEY = "databricks_client_id"
+SP_CLIENT_SECRET_KEY = "databricks_client_secret"
+
 shared_kwargs = dict(
     url=dbutils.widgets.get("url").strip(),
     name=dbutils.widgets.get("name").strip(),
     apply=dbutils.widgets.get("apply") == "true",
     profile=None,
-    verbose=dbutils.widgets.get("verbose") == "true",
+    verbose=False,
 )
 if not shared_kwargs["url"] or not shared_kwargs["name"]:
     raise SystemExit("Both `url` and `name` widgets are required.")
 
-workspace_urls = _auth.parse_workspace_urls(dbutils.widgets.get("workspace_urls"))
 clients = _auth.build_clients(
-    workspace_urls=workspace_urls,
+    workspace_urls=[u.strip().rstrip("/") for u in WORKSPACE_URLS if u and u.strip()],
     secret_scope=dbutils.widgets.get("secret_scope").strip() or None,
-    client_id_key=dbutils.widgets.get("client_id_key").strip(),
-    client_secret_key=dbutils.widgets.get("client_secret_key").strip(),
+    client_id_key=SP_CLIENT_ID_KEY,
+    client_secret_key=SP_CLIENT_SECRET_KEY,
     dbutils=dbutils,
 )
 

@@ -44,11 +44,7 @@
 # COMMAND ----------
 
 # Authentication
-dbutils.widgets.text("workspace_urls", "",
-    "comma-separated target workspace URLs (empty = current workspace)")
 dbutils.widgets.text("secret_scope", "webhook-rollout", "Databricks secret scope")
-dbutils.widgets.text("client_id_key", "databricks_client_id", "secret key for SP client_id")
-dbutils.widgets.text("client_secret_key", "databricks_client_secret", "secret key for SP client_secret")
 
 # Operation
 dbutils.widgets.text("webhook_id", "", "webhook destination ID (required in add mode)")
@@ -65,22 +61,41 @@ dbutils.widgets.text("owner", "", "owner filter (comma-separated emails)")
 dbutils.widgets.dropdown("bundle_jobs", "skip", ["skip", "include", "only"],
     "policy for DAB-managed jobs")
 
-# Output (Delta inventory of bundle-managed jobs encountered)
-dbutils.widgets.text("delta_table", "main.webhook_rollout.bundle_jobs",
-    "fully-qualified UC table for bundle-managed jobs encountered (empty = no Delta output)")
-
 # Performance
 dbutils.widgets.text("name_filter", "",
     "server-side substring filter on job name (forwarded to jobs.list)")
 dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap)")
 dbutils.widgets.text("limit", "", "cap on jobs to update (empty = no cap)")
 
-# Pacing / retries
-dbutils.widgets.text("max_retries", "5", "max retries on 429/5xx")
-dbutils.widgets.text("base_sleep", "0.3", "base sleep (s) between updates")
-dbutils.widgets.text("jitter", "0.4", "max random jitter (s) per update")
-dbutils.widgets.text("progress_every", "500", "log progress every N jobs (0 disables)")
-dbutils.widgets.dropdown("verbose", "false", ["false", "true"], "DEBUG logging")
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Target workspaces
+# MAGIC Edit the list below. One entry per target workspace URL. Leave the list
+# MAGIC empty (`WORKSPACE_URLS = []`) to fall back to notebook-auto-auth against
+# MAGIC the current workspace — handy for one-off testing before secrets are
+# MAGIC wired up.
+
+# COMMAND ----------
+
+WORKSPACE_URLS = [
+    # "https://adb-1234567890123456.7.azuredatabricks.net",
+    # "https://adb-9876543210987654.4.azuredatabricks.net",
+]
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Output destination
+# MAGIC Edit the fully-qualified UC table below before running. This collects the
+# MAGIC bundle-managed jobs encountered during the walk (the rows bundle owners
+# MAGIC need to find which YAML to patch). Set to an empty string to disable.
+# MAGIC The SP must have `USE CATALOG`, `USE SCHEMA`, and `CREATE TABLE` on the
+# MAGIC target schema.
+
+# COMMAND ----------
+
+DELTA_TABLE = "main.webhook_rollout.bundle_jobs"
 
 # COMMAND ----------
 
@@ -98,6 +113,16 @@ for p in (repo_root, notebooks_dir):
 
 import bulk_apply_webhooks
 import _auth
+
+# Hardcoded secret keys + pacing knobs — rarely changed run-to-run, would clutter
+# the widget pane. Edit the constants if your secret scope uses different key
+# names or you need different retry/throttle behaviour.
+SP_CLIENT_ID_KEY = "databricks_client_id"
+SP_CLIENT_SECRET_KEY = "databricks_client_secret"
+MAX_RETRIES = 5
+BASE_SLEEP = 0.3
+JITTER = 0.4
+PROGRESS_EVERY = 500
 
 
 def _parse_csv_ints(s: str):
@@ -125,24 +150,23 @@ shared_kwargs = dict(
     bundle_report="",  # CSV disabled in notebook mode
     apply=dbutils.widgets.get("apply") == "true",
     profile=None,
-    max_retries=int(dbutils.widgets.get("max_retries")),
-    base_sleep=float(dbutils.widgets.get("base_sleep")),
-    jitter=float(dbutils.widgets.get("jitter")),
+    max_retries=MAX_RETRIES,
+    base_sleep=BASE_SLEEP,
+    jitter=JITTER,
     limit=_optional_int(dbutils.widgets.get("limit")),
-    progress_every=int(dbutils.widgets.get("progress_every")),
-    verbose=dbutils.widgets.get("verbose") == "true",
+    progress_every=PROGRESS_EVERY,
+    verbose=False,
     spark=spark,
-    delta_table=dbutils.widgets.get("delta_table").strip() or None,
+    delta_table=DELTA_TABLE or None,
     scan_limit=_optional_int(dbutils.widgets.get("scan_limit")),
     name_filter=dbutils.widgets.get("name_filter").strip() or None,
 )
 
-workspace_urls = _auth.parse_workspace_urls(dbutils.widgets.get("workspace_urls"))
 clients = _auth.build_clients(
-    workspace_urls=workspace_urls,
+    workspace_urls=[u.strip().rstrip("/") for u in WORKSPACE_URLS if u and u.strip()],
     secret_scope=dbutils.widgets.get("secret_scope").strip() or None,
-    client_id_key=dbutils.widgets.get("client_id_key").strip(),
-    client_secret_key=dbutils.widgets.get("client_secret_key").strip(),
+    client_id_key=SP_CLIENT_ID_KEY,
+    client_secret_key=SP_CLIENT_SECRET_KEY,
     dbutils=dbutils,
 )
 
