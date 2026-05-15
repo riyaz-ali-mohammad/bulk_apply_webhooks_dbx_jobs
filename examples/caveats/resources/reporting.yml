@@ -16,9 +16,7 @@ resources:
       webhook_notifications:
         on_failure:
           - id: ${var.webhook_id}
-        on_success:
-          - id: ${var.webhook_id}
-        on_start:
+        on_duration_warning_threshold_exceeded:
           - id: ${var.webhook_id}
       tasks:
         - task_key: build_report

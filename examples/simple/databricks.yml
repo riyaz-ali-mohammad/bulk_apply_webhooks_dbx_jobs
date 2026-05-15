@@ -12,6 +12,11 @@ resources:
       name: webhook-test-job
       tags:
         webhook-test: simple
+      webhook_notifications:
+        on_failure:
+          - id: 9844ca74-670d-434f-a6eb-96947c35d568
+        on_duration_warning_threshold_exceeded:
+          - id: 9844ca74-670d-434f-a6eb-96947c35d568
       tasks:
         - task_key: fail_me
           notebook_task:

@@ -12,5 +12,6 @@ __pycache__/
 # Databricks bundle deployment state (terraform, sync snapshots, binaries)
 .databricks/
 
-# Runtime artifacts from bulk_apply_webhooks.py — contain workspace-specific data
+# Runtime artifacts — contain workspace-specific data
 bundle_jobs.csv
+jobs_inventory.csv

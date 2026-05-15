@@ -58,8 +58,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--webhook-id", required=True, help="Webhook destination ID to attach.")
     p.add_argument(
         "--events",
-        default="on_failure,on_success,on_start",
-        help=f"Comma-separated event list. Valid: {', '.join(EVENT_FIELDS)}.",
+        default="on_failure,on_duration_warning_threshold_exceeded",
+        help=(
+            f"Comma-separated event list. Valid: {', '.join(EVENT_FIELDS)}. "
+            "Default keeps notifications low-noise; pass on_start/on_success explicitly if needed."
+        ),
     )
     p.add_argument(
         "--job",

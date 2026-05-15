@@ -22,6 +22,14 @@ Examples:
 
   # Remove only one destination from specific jobs (others survive)
   python bulk_apply_webhooks.py --remove --job-id 1234 --webhook-id 0123abcd --apply
+
+  # Workspace-wide rollback: detach the destination from every job that has it
+  # (--webhook-id is REQUIRED in this shape; --tag/--owner/--bundle-jobs honored)
+  python bulk_apply_webhooks.py --remove --webhook-id 0123abcd --apply
+
+  # CSV-driven rollback: read job IDs from a file (first column; header auto-skipped)
+  python bulk_apply_webhooks.py --remove --webhook-id 0123abcd \
+      --job-ids-from rollback.txt --apply
 """
 
 import argparse
@@ -104,10 +112,14 @@ def parse_args() -> argparse.Namespace:
         "--remove",
         action="store_true",
         help=(
-            "Remove mode: detach webhook(s) from explicit --job-id(s) instead of bulk-attaching. "
-            "Pair with --webhook-id to remove a specific destination, or omit --webhook-id to "
-            "clear all webhook_notifications. Bundle-managed jobs proceed with a WARNING since "
-            "API removal is non-durable across `bundle deploy`."
+            "Remove mode: detach webhook(s) from jobs instead of bulk-attaching. "
+            "Three shapes: (1) per-job: pair with --job-id / --job-ids-from to target "
+            "explicit jobs; --webhook-id optional (omit to clear all webhook_notifications "
+            "on those jobs). (2) workspace-walk: omit --job-id; --webhook-id REQUIRED; "
+            "walks the workspace (honoring --tag/--owner/--bundle-jobs) and removes only "
+            "that destination from every matching job that currently has it. "
+            "Bundle-managed jobs in per-job mode proceed with a WARNING; in walk mode "
+            "they follow --bundle-jobs (default `skip`)."
         ),
     )
     p.add_argument(
@@ -115,19 +127,42 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         type=int,
-        help="Job ID to operate on. Required with --remove. Repeatable.",
+        help=(
+            "Job ID to operate on. Use with --remove (per-job rollback). Repeatable. "
+            "Mutually exclusive with --tag/--owner filters in remove mode."
+        ),
+    )
+    p.add_argument(
+        "--job-ids-from",
+        help=(
+            "Path to a text or CSV file containing job IDs to operate on, one per line "
+            "(first column if CSV). Header row auto-detected. Combines with --job-id. "
+            "Composes with jobs_inventory.csv / bundle_jobs.csv via `awk -F, ...`."
+        ),
     )
     p.add_argument(
         "--events",
-        default="on_failure,on_success,on_start",
-        help=f"Comma-separated event list (add mode only). Valid: {', '.join(EVENT_FIELDS)}.",
+        default="on_failure,on_duration_warning_threshold_exceeded",
+        help=(
+            f"Comma-separated event list (add mode only). Valid: {', '.join(EVENT_FIELDS)}. "
+            "Default keeps notifications low-noise; pass on_start/on_success explicitly if needed."
+        ),
     )
-    p.add_argument("--tag", help="Filter by job tag. Format: key=value, or just key for presence-only.")
+    p.add_argument(
+        "--tag",
+        help=(
+            "Filter by job tag. Format: key=value, or just key for presence-only. "
+            "Used in add mode and in workspace-walk remove (no --job-id)."
+        ),
+    )
     p.add_argument(
         "--owner",
         action="append",
         default=[],
-        help="Filter by creator_user_name. Repeatable for multiple owners.",
+        help=(
+            "Filter by creator_user_name. Repeatable for multiple owners. "
+            "Used in add mode and in workspace-walk remove (no --job-id)."
+        ),
     )
     p.add_argument(
         "--bundle-jobs",
@@ -160,13 +195,26 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
     if args.remove:
-        if not args.job_id:
-            p.error("--remove requires at least one --job-id.")
+        has_explicit_jobs = bool(args.job_id) or bool(args.job_ids_from)
+        has_filters = bool(args.tag) or bool(args.owner)
+        if has_explicit_jobs and has_filters:
+            p.error(
+                "--tag/--owner filter the workspace walk; they don't combine with "
+                "explicit --job-id/--job-ids-from. Drop the filters, or drop the explicit job list."
+            )
+        if not has_explicit_jobs and not args.webhook_id:
+            p.error(
+                "--remove without --job-id/--job-ids-from is workspace-walk mode and REQUIRES "
+                "--webhook-id (refusing to clear every webhook in the workspace from one CLI call)."
+            )
     else:
         if not args.webhook_id:
             p.error("--webhook-id is required (unless using --remove).")
-        if args.job_id:
-            p.error("--job-id is only valid with --remove. In add mode, use --tag/--owner filters.")
+        if args.job_id or args.job_ids_from:
+            p.error(
+                "--job-id/--job-ids-from is only valid with --remove. "
+                "In add mode, use --tag/--owner filters."
+            )
     return args
 
 
@@ -316,6 +364,49 @@ def merge_webhooks(
     return WebhookNotifications(**kwargs)
 
 
+def webhook_attached(existing: Optional[WebhookNotifications], webhook_id: str) -> bool:
+    """True if webhook_id appears on at least one event list in `existing`.
+    Used by the workspace-walk rollback to skip jobs that don't have the destination."""
+    if not existing:
+        return False
+    for ev in EVENT_FIELDS:
+        cur = getattr(existing, ev, None) or []
+        if any(w.id == webhook_id for w in cur):
+            return True
+    return False
+
+
+def load_job_ids_from_file(path: str) -> List[int]:
+    """Read job IDs from a text or CSV file (first column).
+
+    Tolerates: blank lines, surrounding whitespace, BOM on the first cell,
+    and a CSV header row (auto-detected when the first cell isn't an int —
+    so `jobs_inventory.csv` / `bundle_jobs.csv` can be piped in directly).
+    Raises SystemExit on empty input or a non-numeric mid-file cell."""
+    job_ids: List[int] = []
+    first_data_row = True
+    with open(path, newline="", encoding="utf-8-sig") as fh:  # utf-8-sig drops a leading BOM
+        reader = csv.reader(fh)
+        for row in reader:
+            if not row:
+                continue
+            cell = row[0].strip()
+            if not cell:
+                continue
+            try:
+                job_ids.append(int(cell))
+                first_data_row = False
+            except ValueError:
+                if first_data_row:
+                    # Looks like a header row; skip silently.
+                    first_data_row = False
+                    continue
+                raise SystemExit(f"Bad job ID in {path}: {cell!r}")
+    if not job_ids:
+        raise SystemExit(f"No job IDs found in {path}.")
+    return job_ids
+
+
 def remove_webhooks(
     existing: Optional[WebhookNotifications],
     webhook_id: Optional[str],
@@ -410,31 +501,21 @@ def process_job(
         logging.error("Job %s (%s): update failed: %s", job.job_id, name, e)
 
 
-def process_remove_job(
+def _apply_remove_to_job(
     w: WorkspaceClient,
-    job_id: int,
+    job: BaseJob,
     webhook_id: Optional[str],
     apply: bool,
     max_retries: int,
     stats: Stats,
 ) -> None:
-    try:
-        job = call_with_backoff(lambda: w.jobs.get(job_id=job_id), max_retries=max_retries)
-    except Exception as e:
-        stats.errored += 1
-        logging.error("Job %s: lookup failed: %s", job_id, e)
-        return
+    """Compute the new webhook_notifications and (if --apply) call jobs.update.
 
+    Caller is responsible for bundle-policy decisions / WARNINGs and any pre-filter
+    (e.g. walk-mode's webhook_attached check). This function only touches `stats`
+    for the outcomes of the remove step itself."""
+    job_id = job.job_id
     name = (job.settings.name if job.settings else None) or "<unnamed>"
-    stats.matched += 1
-
-    bundle, _ = is_bundle_job(job)
-    if bundle:
-        logging.warning(
-            "Job %s (%s): bundle-managed — API removal is non-durable; next `bundle deploy` "
-            "will re-add the webhook unless the bundle YAML is also patched.",
-            job_id, name,
-        )
 
     existing = job.settings.webhook_notifications if job.settings else None
     if not existing:
@@ -476,14 +557,63 @@ def process_remove_job(
         logging.error("Job %s (%s): remove failed: %s", job_id, name, e)
 
 
+def process_remove_job(
+    w: WorkspaceClient,
+    job_id: int,
+    webhook_id: Optional[str],
+    apply: bool,
+    max_retries: int,
+    stats: Stats,
+) -> None:
+    """Per-job-id remove: looks the job up, WARNs if bundle-managed, then delegates
+    to `_apply_remove_to_job`. Bundle jobs proceed because each job-id is explicit
+    here — the user chose to target them."""
+    try:
+        job = call_with_backoff(lambda: w.jobs.get(job_id=job_id), max_retries=max_retries)
+    except Exception as e:
+        stats.errored += 1
+        logging.error("Job %s: lookup failed: %s", job_id, e)
+        return
+
+    name = (job.settings.name if job.settings else None) or "<unnamed>"
+    stats.matched += 1
+
+    bundle, _ = is_bundle_job(job)
+    if bundle:
+        logging.warning(
+            "Job %s (%s): bundle-managed — API removal is non-durable; next `bundle deploy` "
+            "will re-add the webhook unless the bundle YAML is also patched.",
+            job_id, name,
+        )
+
+    _apply_remove_to_job(w, job, webhook_id, apply, max_retries, stats)
+
+
+def _resolve_remove_job_ids(args: argparse.Namespace) -> List[int]:
+    """Merge --job-id and --job-ids-from into a single de-duplicated ordered list."""
+    job_ids: List[int] = list(args.job_id)
+    if args.job_ids_from:
+        job_ids.extend(load_job_ids_from_file(args.job_ids_from))
+    # Preserve order, drop duplicates.
+    seen = set()
+    deduped: List[int] = []
+    for jid in job_ids:
+        if jid not in seen:
+            seen.add(jid)
+            deduped.append(jid)
+    return deduped
+
+
 def run_remove_mode(args: argparse.Namespace, w: WorkspaceClient, stats: Stats) -> int:
+    """Per-job-id rollback path. Explicit job IDs, no workspace listing, no filters."""
+    job_ids = _resolve_remove_job_ids(args)
     logging.info(
-        "Mode=%s op=REMOVE webhook_filter=%s jobs=%s",
+        "Mode=%s op=REMOVE webhook_filter=%s job_count=%d",
         "APPLY" if args.apply else "DRY-RUN",
         args.webhook_id or "<all>",
-        args.job_id,
+        len(job_ids),
     )
-    for job_id in args.job_id:
+    for job_id in job_ids:
         stats.scanned += 1
         process_remove_job(w, job_id, args.webhook_id, args.apply, args.max_retries, stats)
         if args.apply:
@@ -497,6 +627,89 @@ def run_remove_mode(args: argparse.Namespace, w: WorkspaceClient, stats: Stats) 
     return 1 if stats.errored else 0
 
 
+def run_remove_walk_mode(args: argparse.Namespace, w: WorkspaceClient, stats: Stats) -> int:
+    """Workspace-walk rollback path. Mirrors add mode's main loop:
+    list -> filter -> bundle policy -> mutate. Pre-filters via `webhook_attached`
+    so jobs that don't currently have the destination get a DEBUG line and skip
+    the API call."""
+    filters = parse_filters(args)
+    bundle_records: List[BundleJobRecord] = []
+    bundle_meta_cache: Dict[str, Optional[BundleMetadata]] = {}
+
+    logging.info(
+        "Mode=%s op=REMOVE-WALK webhook=%s tag=%s owners=%s bundle_jobs=%s limit=%s",
+        "APPLY" if args.apply else "DRY-RUN",
+        args.webhook_id,
+        f"{filters.tag_key}={filters.tag_value}" if filters.tag_key else None,
+        filters.owners or None,
+        args.bundle_jobs,
+        args.limit,
+    )
+
+    for job in w.jobs.list(expand_tasks=False):
+        stats.scanned += 1
+        if args.progress_every and stats.scanned % args.progress_every == 0:
+            logging.info(
+                "...scanned=%d matched=%d would_update=%d updated=%d bundle_skipped=%d",
+                stats.scanned, stats.matched, stats.would_update, stats.updated, stats.bundle_skipped,
+            )
+        if not job_matches(job, filters):
+            continue
+        stats.matched += 1
+
+        bundle, meta_path = is_bundle_job(job)
+        name = (job.settings.name if job.settings else None) or "<unnamed>"
+
+        if bundle:
+            md = fetch_bundle_metadata(w, meta_path, bundle_meta_cache)
+            bundle_records.append(BundleJobRecord(
+                job_id=job.job_id, name=name,
+                metadata_file_path=meta_path, creator=job.creator_user_name,
+                metadata=md,
+            ))
+            if args.bundle_jobs == "skip":
+                stats.bundle_skipped += 1
+                logging.info("Job %s (%s): SKIP bundle-managed (deploy will re-add API removals). meta=%s",
+                             job.job_id, name, meta_path)
+                continue
+            if args.bundle_jobs == "include":
+                logging.warning(
+                    "Job %s (%s): bundle-managed — API removal is non-durable; next `bundle deploy` "
+                    "will re-add the webhook unless the bundle YAML is also patched.",
+                    job.job_id, name,
+                )
+        else:
+            if args.bundle_jobs == "only":
+                logging.debug("Job %s (%s): skipping non-bundle job (--bundle-jobs=only).", job.job_id, name)
+                continue
+
+        existing = job.settings.webhook_notifications if job.settings else None
+        if not webhook_attached(existing, args.webhook_id):
+            stats.already_attached += 1
+            logging.debug("Job %s (%s): webhook %s not currently attached; skipping.",
+                          job.job_id, name, args.webhook_id)
+            continue
+
+        _apply_remove_to_job(w, job, args.webhook_id, args.apply, args.max_retries, stats)
+
+        if args.apply:
+            time.sleep(args.base_sleep + random.uniform(0, args.jitter))
+
+        if args.limit is not None and (stats.updated + stats.would_update) >= args.limit:
+            logging.info("Reached --limit=%d, stopping.", args.limit)
+            break
+
+    write_bundle_report(args.bundle_report, bundle_records)
+
+    logging.info(
+        "Done. op=REMOVE-WALK scanned=%d matched=%d nothing_to_remove=%d bundle_skipped=%d "
+        "would_update=%d updated=%d errored=%d bundle_total=%d",
+        stats.scanned, stats.matched, stats.already_attached, stats.bundle_skipped,
+        stats.would_update, stats.updated, stats.errored, len(bundle_records),
+    )
+    return 1 if stats.errored else 0
+
+
 def main() -> int:
     args = parse_args()
     setup_logging(args.verbose)
@@ -505,7 +718,9 @@ def main() -> int:
     stats = Stats()
 
     if args.remove:
-        return run_remove_mode(args, w, stats)
+        if args.job_id or args.job_ids_from:
+            return run_remove_mode(args, w, stats)
+        return run_remove_walk_mode(args, w, stats)
 
     events = parse_events(args.events)
     filters = parse_filters(args)
