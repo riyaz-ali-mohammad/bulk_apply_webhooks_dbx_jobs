@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "1"
+# ///
 # MAGIC %md
 # MAGIC # Inventory Jobs (read-only, multi-workspace)
 # MAGIC
@@ -31,14 +35,6 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC No `%pip install` needed — this notebook only imports `databricks-sdk`,
-# MAGIC which is pre-installed in the Databricks runtime. Installing it again
-# MAGIC from PyPI would upgrade `protobuf` past the runtime's pinned version
-# MAGIC and break PySpark (the Delta write below).
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC ## Widgets
 
 # COMMAND ----------
@@ -54,8 +50,6 @@ dbutils.widgets.dropdown("enrich_bundles", "false", ["false", "true"],
     "fetch per-bundle metadata (one /Workspace download per unique bundle)")
 
 # Performance
-dbutils.widgets.text("name_filter", "",
-    "server-side substring filter on job name (forwarded to jobs.list)")
 dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap)")
 
 # COMMAND ----------
@@ -70,8 +64,8 @@ dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap
 # COMMAND ----------
 
 WORKSPACE_URLS = [
-    # "https://adb-1234567890123456.7.azuredatabricks.net",
-    # "https://adb-9876543210987654.4.azuredatabricks.net",
+    'https://e2-demo-field-eng.cloud.databricks.com/',
+    'https://e2-demo-west.cloud.databricks.com/'
 ]
 for u in WORKSPACE_URLS:
     print(u)
@@ -85,7 +79,7 @@ for u in WORKSPACE_URLS:
 
 # COMMAND ----------
 
-DELTA_TABLE = "main.webhook_rollout.jobs_inventory"
+DELTA_TABLE = "riz_catalog.webhook_rollout.jobs_inventory"
 
 # COMMAND ----------
 
@@ -100,7 +94,6 @@ secret_scope = dbutils.widgets.get("secret_scope").strip()
 tag = dbutils.widgets.get("tag").strip()
 owner_raw = dbutils.widgets.get("owner").strip()
 enrich_bundles = dbutils.widgets.get("enrich_bundles")
-name_filter = dbutils.widgets.get("name_filter").strip()
 scan_limit = dbutils.widgets.get("scan_limit").strip()
 
 # COMMAND ----------
@@ -109,7 +102,6 @@ print(f"secret_scope:   {secret_scope!r}")
 print(f"tag:            {tag!r}")
 print(f"owner:          {owner_raw!r}")
 print(f"enrich_bundles: {enrich_bundles!r}")
-print(f"name_filter:    {name_filter!r}")
 print(f"scan_limit:     {scan_limit!r}")
 
 # COMMAND ----------
@@ -183,7 +175,6 @@ shared_kwargs = dict(
     spark=spark,
     delta_table=DELTA_TABLE,
     scan_limit=_optional_int(scan_limit),
-    name_filter=name_filter or None,
 )
 
 clients = _auth.build_clients(
@@ -218,4 +209,4 @@ print(f"\nDone. SELECT * FROM {DELTA_TABLE}")
 # MAGIC %sql
 # MAGIC -- Inspect the inventory written above. Edit the table name if you
 # MAGIC -- changed the DELTA_TABLE constant.
-# MAGIC SELECT * FROM main.webhook_rollout.jobs_inventory
+# MAGIC SELECT * FROM riz_catalog.webhook_rollout.jobs_inventory
