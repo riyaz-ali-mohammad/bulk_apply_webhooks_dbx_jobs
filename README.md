@@ -170,21 +170,21 @@ so tag-filtered walks must iterate the full job list. Two widgets help here:
    workspace and put `databricks_client_id` and `databricks_client_secret`
    into it.
 4. Check out this repo as a Databricks Git folder in the management workspace.
-5. Open `notebooks/inventory_jobs` first (read-only). Fill widgets:
+5. Open `notebooks/inventory_jobs_nb` first (read-only). Fill widgets:
    - `workspace_urls` = comma-separated target hosts
    - `secret_scope` = `webhook-rollout`
    - `delta_table` = e.g. `main.webhook_rollout.jobs_inventory`
 6. Run it. `SELECT * FROM main.webhook_rollout.jobs_inventory` should show one
    row per job across all listed workspaces.
-7. Then `notebooks/create_webhook_destination` to provision the destination in
+7. Then `notebooks/create_webhook_destination_nb` to provision the destination in
    each workspace (apply=true once the dry-run looks right).
-8. Then `notebooks/apply_webhooks_to_direct_jobs` to attach the destination
+8. Then `notebooks/apply_webhooks_to_direct_jobs_nb` to attach the destination
    to directly-deployed jobs. Bundle-managed jobs are always skipped. The
    bundle-managed jobs that need patching are visible in the
    `jobs_inventory` Delta table from step 6 (filter
    `WHERE deployment_kind = 'BUNDLE'`).
 9. For each owning bundle, the bundle owner clones the DAB repo as a
-   Databricks Git folder, opens `notebooks/patch_bundle_yaml`, runs dry-run,
+   Databricks Git folder, opens `notebooks/patch_bundle_yaml_nb`, runs dry-run,
    then apply.
    Commits + pushes from the Repos UI; CI runs `databricks bundle validate`
    and merge triggers `databricks bundle deploy`. The notebook **does not**

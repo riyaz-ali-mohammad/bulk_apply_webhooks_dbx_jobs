@@ -47,14 +47,14 @@ End-to-end validation against a real workspace is still manual via the `examples
 ├── requirements-dev.txt           # Pulls in requirements.txt + pytest.
 ├── pytest.ini                     # testpaths=tests, pythonpath=. so tests can import top-level scripts.
 ├── README.md                      # Long-form user docs; cite section names when changing behavior.
-├── notebooks/                     # Databricks source-format notebooks (.py with "# Databricks notebook source" header).
-│   ├── README.md                      # Hands-on runbook for the support team running the notebooks.
-│   ├── _auth.py                       # Shared client-builder used by the four SDK notebooks (multi-workspace via SP OAuth M2M).
-│   ├── inventory_jobs.py              # Widgets + multi-workspace loop calling inventory_jobs.run(client=..., delta_table=...).
-│   ├── apply_webhooks_to_direct_jobs.py  # ADD-mode widgets + multi-workspace loop. No bundle_jobs widget, no Delta output.
-│   ├── remove_webhooks.py             # REMOVE-mode widgets (per-job + walk); auto-picks shape from which widgets are filled.
-│   ├── create_webhook_destination.py  # Same pattern; no Delta output.
-│   └── patch_bundle_yaml.py           # Single-workspace; reads/writes YAMLs in a Databricks Git folder.
+├── notebooks/                     # Databricks source-format notebooks. All notebook files end in _nb.py to avoid name collisions with the top-level scripts they import (sys.path includes notebooks/, so a notebook named identically to its script would shadow it).
+│   ├── README.md                              # Hands-on runbook for the support team running the notebooks.
+│   ├── _auth.py                               # Shared client-builder used by the four SDK notebooks (multi-workspace via SP OAuth M2M). NOT a notebook — no _nb suffix.
+│   ├── inventory_jobs_nb.py                   # Widgets + multi-workspace loop calling inventory_jobs.run(client=..., delta_table=...).
+│   ├── apply_webhooks_to_direct_jobs_nb.py    # ADD-mode widgets + multi-workspace loop. No bundle_jobs widget, no Delta output.
+│   ├── remove_webhooks_nb.py                  # REMOVE-mode widgets (per-job + walk); auto-picks shape from which widgets are filled.
+│   ├── create_webhook_destination_nb.py       # Same pattern; no Delta output.
+│   └── patch_bundle_yaml_nb.py                # Single-workspace; reads/writes YAMLs in a Databricks Git folder.
 ├── tests/
 │   ├── test_inventory_jobs.py         # Classification + filters + CSV schema + end-to-end main() drive + notebook-only kwargs (client/scan_limit/name_filter).
 │   ├── test_apply_webhooks_to_direct_jobs.py  # ADD-path-only: non-DAB attach, always-skip-bundle invariant, run-callable contract.

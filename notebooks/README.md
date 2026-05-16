@@ -6,13 +6,19 @@ rationale; this one is the runbook for the support team.
 
 ```
 notebooks/
-├── _auth.py                       (helper — do not run directly)
-├── inventory_jobs.py              read-only: list jobs, classify BUNDLE vs DIRECT, write Delta
-├── create_webhook_destination.py  create the webhook destination (idempotent on display_name)
-├── apply_webhooks_to_direct_jobs.py  attach the destination to direct-deployed jobs (DAB jobs always skipped)
-├── remove_webhooks.py             detach the destination from jobs (rollback / cleanup)
-└── patch_bundle_yaml.py           edit DAB YAML in place for bundle-managed jobs
+├── _auth.py                          (helper — do not run directly)
+├── inventory_jobs_nb.py              read-only: list jobs, classify BUNDLE vs DIRECT, write Delta
+├── create_webhook_destination_nb.py  create the webhook destination (idempotent on display_name)
+├── apply_webhooks_to_direct_jobs_nb.py  attach the destination to direct-deployed jobs (DAB jobs always skipped)
+├── remove_webhooks_nb.py             detach the destination from jobs (rollback / cleanup)
+└── patch_bundle_yaml_nb.py           edit DAB YAML in place for bundle-managed jobs
 ```
+
+The notebook files end in `_nb.py` to avoid name collisions with the top-level
+scripts they import. Each notebook imports the matching top-level script by
+its short name (e.g. `notebooks/remove_webhooks_nb.py` does `import remove_webhooks`).
+This is purely a packaging concern — section headers below use the conceptual
+short names (`inventory_jobs`, `remove_webhooks`, etc.).
 
 ## One-time setup (admin)
 
@@ -170,7 +176,7 @@ Widgets:
 | `scan_limit`     | Hard cap on jobs scanned per workspace (empty = no cap)            |
 
 To run:
-1. Open `notebooks/inventory_jobs` in the Databricks Git folder.
+1. Open `notebooks/inventory_jobs_nb` in the Databricks Git folder.
 2. Edit `WORKSPACE_URLS` and `DELTA_TABLE` cells.
 3. Set widgets in the UI (most can be left at defaults for a first pass).
 4. **Run All**.
@@ -309,7 +315,7 @@ Widgets:
 To run:
 1. Bundle owner clones the DAB repo as a Databricks Git folder, e.g.
    `/Workspace/Repos/<user>/<dab-repo>`.
-2. Opens `notebooks/patch_bundle_yaml` (from **this** repo's checkout, not
+2. Opens `notebooks/patch_bundle_yaml_nb` (from **this** repo's checkout, not
    the DAB's).
 3. Sets `bundle_dir` to the DAB Git folder path, `webhook_id` to the
    destination from step 2.

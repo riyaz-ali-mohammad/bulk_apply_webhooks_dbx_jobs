@@ -108,6 +108,23 @@ class BundleJobRecord:
     metadata: Optional[BundleMetadata] = None
 
 
+@dataclass
+class RemovalRecord:
+    """One row of the audit log for a successful webhook removal.
+
+    Built only after `w.jobs.update` returns OK (apply mode); dry-runs do not
+    produce rows. `bundle` / `metadata_file_path` are populated for bundle-managed
+    jobs and left None for direct jobs."""
+    job_id: int
+    name: str
+    creator: Optional[str]
+    is_bundle: bool
+    webhook_ids_removed: List[str]
+    events_affected: List[str]
+    metadata_file_path: Optional[str] = None
+    bundle: Optional[BundleMetadata] = None
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
@@ -299,24 +316,31 @@ def write_bundle_report(path: str, records: List[BundleJobRecord]) -> None:
     logging.info("Wrote %d bundle-job records to %s", len(records), path)
 
 
-def write_bundle_report_delta(spark, table: str, records: List[BundleJobRecord], workspace_label: str) -> None:
-    """Write bundle-job records to a Delta table partitioned by workspace_host.
-    Per-workspace re-runs replace only that workspace's partition. See the
-    matching helper in inventory_jobs.py for partition-overwrite rationale."""
+def write_removal_log_delta(spark, table: str, records: List["RemovalRecord"], workspace_label: str) -> None:
+    """Append removal-audit rows to a Delta table partitioned by workspace_host.
+
+    This is an audit log — every row records one successful `jobs.update` that
+    detached at least one webhook. Mode is `append` (not overwrite): re-running
+    the rollback later adds new rows; it never clobbers history. `is_bundle=true`
+    rows carry bundle metadata (name, target, git, workspace path); `is_bundle=false`
+    rows leave those columns empty for direct jobs."""
     if not records:
-        logging.info("No bundle records to write to %s.", table)
+        logging.info("No removal records to write to %s.", table)
         return
     import datetime
-    scanned_at = datetime.datetime.now(datetime.timezone.utc)
+    deleted_at = datetime.datetime.now(datetime.timezone.utc)
     rows = []
     for r in records:
-        md = r.metadata or BundleMetadata()
+        md = r.bundle or BundleMetadata()
         rows.append({
             "workspace_host": workspace_label,
-            "scanned_at": scanned_at,
+            "deleted_at": deleted_at,
             "job_id": r.job_id,
             "name": r.name,
             "creator": r.creator or "",
+            "is_bundle": r.is_bundle,
+            "webhook_ids_removed": list(r.webhook_ids_removed),
+            "events_affected": list(r.events_affected),
             "bundle_name": md.bundle_name or "",
             "target": md.target or "",
             "git_origin": md.git_origin or "",
@@ -329,12 +353,11 @@ def write_bundle_report_delta(spark, table: str, records: List[BundleJobRecord],
     df = spark.createDataFrame(rows)
     (df.write
         .format("delta")
-        .mode("overwrite")
-        .option("partitionOverwriteMode", "dynamic")
+        .mode("append")
         .option("mergeSchema", "true")
         .partitionBy("workspace_host")
         .saveAsTable(table))
-    logging.info("Wrote %d bundle-job records to Delta table %s (workspace_host=%s)",
+    logging.info("Appended %d removal records to Delta table %s (workspace_host=%s)",
                  len(records), table, workspace_label)
 
 
@@ -396,14 +419,21 @@ def load_job_ids_from_file(path: str) -> List[int]:
 def remove_webhooks(
     existing: Optional[WebhookNotifications],
     webhook_id: Optional[str],
-) -> Tuple[WebhookNotifications, int]:
-    """Return (new_notifications, count_removed). If webhook_id is None, clears every event list;
-    otherwise removes only entries matching webhook_id. Events that end up empty are sent as []
-    so the API actually clears the list rather than treating absent == no-change."""
+) -> Tuple[WebhookNotifications, int, List[str], List[str]]:
+    """Compute the new webhook_notifications block plus an audit summary.
+
+    Returns (new_notifications, count_removed, ids_removed, events_affected).
+    `ids_removed` is deduped (first-occurrence order) — useful when webhook_id is
+    None and a single job had several distinct destinations cleared. Events that
+    end up empty are sent as [] so the API actually clears the list rather than
+    treating absent == no-change."""
     if not existing:
-        return WebhookNotifications(), 0
+        return WebhookNotifications(), 0, [], []
     kwargs = {}
     removed = 0
+    ids_removed: List[str] = []
+    events_affected: List[str] = []
+    seen_ids = set()
     for ev in EVENT_FIELDS:
         cur = list(getattr(existing, ev, None) or [])
         if not cur:
@@ -411,14 +441,23 @@ def remove_webhooks(
         if webhook_id is None:
             removed += len(cur)
             kwargs[ev] = []
+            events_affected.append(ev)
+            for wh in cur:
+                if wh.id and wh.id not in seen_ids:
+                    seen_ids.add(wh.id)
+                    ids_removed.append(wh.id)
         else:
             kept = [wh for wh in cur if wh.id != webhook_id]
             if len(kept) != len(cur):
                 removed += len(cur) - len(kept)
                 kwargs[ev] = kept
+                events_affected.append(ev)
+                if webhook_id not in seen_ids:
+                    seen_ids.add(webhook_id)
+                    ids_removed.append(webhook_id)
             else:
                 kwargs[ev] = cur
-    return WebhookNotifications(**kwargs), removed
+    return WebhookNotifications(**kwargs), removed, ids_removed, events_affected
 
 
 def is_transient(err: Exception) -> bool:
@@ -454,12 +493,20 @@ def _apply_remove_to_job(
     apply: bool,
     max_retries: int,
     stats: Stats,
+    *,
+    removal_records: Optional[List[RemovalRecord]] = None,
+    bundle_meta: Optional[BundleMetadata] = None,
+    bundle_meta_path: Optional[str] = None,
 ) -> None:
     """Compute the new webhook_notifications and (if --apply) call jobs.update.
 
     Caller is responsible for bundle-policy decisions / WARNINGs and any pre-filter
     (e.g. walk-mode's webhook_attached check). This function only touches `stats`
-    for the outcomes of the remove step itself."""
+    for the outcomes of the remove step itself.
+
+    If `removal_records` is passed, a `RemovalRecord` is appended on each
+    successful `jobs.update` — dry-run rows are intentionally not recorded
+    (the audit log captures actual deletions, not previews)."""
     job_id = job.job_id
     name = (job.settings.name if job.settings else None) or "<unnamed>"
 
@@ -470,7 +517,7 @@ def _apply_remove_to_job(
                      job_id, name)
         return
 
-    new_wh, count = remove_webhooks(existing, webhook_id)
+    new_wh, count, ids_removed, events_affected = remove_webhooks(existing, webhook_id)
     if count == 0:
         stats.already_attached += 1
         logging.info("Job %s (%s): webhook %s not currently attached; no-op.",
@@ -498,6 +545,18 @@ def _apply_remove_to_job(
             max_retries=max_retries,
         )
         stats.updated += 1
+        if removal_records is not None:
+            is_bundle, _ = is_bundle_job(job)
+            removal_records.append(RemovalRecord(
+                job_id=job_id,
+                name=name,
+                creator=job.creator_user_name,
+                is_bundle=is_bundle,
+                webhook_ids_removed=ids_removed,
+                events_affected=events_affected,
+                metadata_file_path=bundle_meta_path,
+                bundle=bundle_meta,
+            ))
     except Exception as e:
         stats.errored += 1
         logging.error("Job %s (%s): remove failed: %s", job_id, name, e)
@@ -510,10 +569,16 @@ def process_remove_job(
     apply: bool,
     max_retries: int,
     stats: Stats,
+    *,
+    removal_records: Optional[List[RemovalRecord]] = None,
+    bundle_meta_cache: Optional[Dict[str, Optional[BundleMetadata]]] = None,
 ) -> None:
     """Per-job-id remove: looks the job up, WARNs if bundle-managed, then delegates
     to `_apply_remove_to_job`. Bundle jobs proceed because each job-id is explicit
-    here — the user chose to target them."""
+    here — the user chose to target them.
+
+    When `removal_records` is set, bundle metadata is fetched for bundle-managed
+    jobs so the audit row carries bundle/git context."""
     try:
         job = call_with_backoff(lambda: w.jobs.get(job_id=job_id), max_retries=max_retries)
     except Exception as e:
@@ -524,15 +589,23 @@ def process_remove_job(
     name = (job.settings.name if job.settings else None) or "<unnamed>"
     stats.matched += 1
 
-    bundle, _ = is_bundle_job(job)
+    bundle, meta_path = is_bundle_job(job)
+    bundle_meta: Optional[BundleMetadata] = None
     if bundle:
         logging.warning(
             "Job %s (%s): bundle-managed — API removal is non-durable; next `bundle deploy` "
             "will re-add the webhook unless the bundle YAML is also patched.",
             job_id, name,
         )
+        if removal_records is not None and bundle_meta_cache is not None and meta_path:
+            bundle_meta = fetch_bundle_metadata(w, meta_path, bundle_meta_cache)
 
-    _apply_remove_to_job(w, job, webhook_id, apply, max_retries, stats)
+    _apply_remove_to_job(
+        w, job, webhook_id, apply, max_retries, stats,
+        removal_records=removal_records,
+        bundle_meta=bundle_meta,
+        bundle_meta_path=meta_path,
+    )
 
 
 def _resolve_remove_job_ids(args: argparse.Namespace) -> List[int]:
@@ -553,6 +626,13 @@ def _resolve_remove_job_ids(args: argparse.Namespace) -> List[int]:
 def run_remove_mode(args: argparse.Namespace, w: WorkspaceClient, stats: Stats) -> int:
     """Per-job-id rollback path. Explicit job IDs, no workspace listing, no filters."""
     job_ids = _resolve_remove_job_ids(args)
+    delta_table = getattr(args, "delta_table", None)
+    spark = getattr(args, "spark", None)
+    workspace_label = getattr(args, "workspace_label", None) or w.config.host
+
+    removal_records: List[RemovalRecord] = []
+    bundle_meta_cache: Dict[str, Optional[BundleMetadata]] = {}
+
     logging.info(
         "Mode=%s op=REMOVE webhook_filter=%s job_count=%d",
         "APPLY" if args.apply else "DRY-RUN",
@@ -561,9 +641,22 @@ def run_remove_mode(args: argparse.Namespace, w: WorkspaceClient, stats: Stats) 
     )
     for job_id in job_ids:
         stats.scanned += 1
-        process_remove_job(w, job_id, args.webhook_id, args.apply, args.max_retries, stats)
+        process_remove_job(
+            w, job_id, args.webhook_id, args.apply, args.max_retries, stats,
+            removal_records=removal_records if (delta_table and args.apply) else None,
+            bundle_meta_cache=bundle_meta_cache if (delta_table and args.apply) else None,
+        )
         if args.apply:
             time.sleep(args.base_sleep + random.uniform(0, args.jitter))
+
+    if delta_table:
+        if not args.apply:
+            logging.info("Dry-run: skipping write to Delta table %s (audit log is apply-only).",
+                         delta_table)
+        elif spark is None:
+            raise SystemExit("delta_table requires a `spark` kwarg (the notebook's SparkSession).")
+        else:
+            write_removal_log_delta(spark, delta_table, removal_records, workspace_label)
 
     logging.info(
         "Done. op=REMOVE scanned=%d matched=%d nothing_to_remove=%d would_update=%d updated=%d errored=%d",
@@ -577,10 +670,21 @@ def run_remove_walk_mode(args: argparse.Namespace, w: WorkspaceClient, stats: St
     """Workspace-walk rollback path. Mirrors add mode's main loop:
     list -> filter -> bundle policy -> mutate. Pre-filters via `webhook_attached`
     so jobs that don't currently have the destination get a DEBUG line and skip
-    the API call."""
+    the API call.
+
+    Two independent output streams: `bundle_records` feeds the CLI's
+    `--bundle-report` CSV (inventory of bundle-managed jobs encountered, regardless
+    of whether removal happened), and `removal_records` feeds the notebook's
+    Delta audit log (one row per successful `jobs.update`, apply-only)."""
     filters = parse_filters(args)
     bundle_records: List[BundleJobRecord] = []
     bundle_meta_cache: Dict[str, Optional[BundleMetadata]] = {}
+    removal_records: List[RemovalRecord] = []
+
+    delta_table = getattr(args, "delta_table", None)
+    spark = getattr(args, "spark", None)
+    workspace_label = getattr(args, "workspace_label", None) or w.config.host
+    track_removals = bool(delta_table and args.apply)
 
     scan_limit = getattr(args, "scan_limit", None)
     name_filter = getattr(args, "name_filter", None)
@@ -616,13 +720,14 @@ def run_remove_walk_mode(args: argparse.Namespace, w: WorkspaceClient, stats: St
 
         bundle, meta_path = is_bundle_job(job)
         name = (job.settings.name if job.settings else None) or "<unnamed>"
+        bundle_meta: Optional[BundleMetadata] = None
 
         if bundle:
-            md = fetch_bundle_metadata(w, meta_path, bundle_meta_cache)
+            bundle_meta = fetch_bundle_metadata(w, meta_path, bundle_meta_cache)
             bundle_records.append(BundleJobRecord(
                 job_id=job.job_id, name=name,
                 metadata_file_path=meta_path, creator=job.creator_user_name,
-                metadata=md,
+                metadata=bundle_meta,
             ))
             if args.bundle_jobs == "skip":
                 stats.bundle_skipped += 1
@@ -647,7 +752,12 @@ def run_remove_walk_mode(args: argparse.Namespace, w: WorkspaceClient, stats: St
                           job.job_id, name, args.webhook_id)
             continue
 
-        _apply_remove_to_job(w, job, args.webhook_id, args.apply, args.max_retries, stats)
+        _apply_remove_to_job(
+            w, job, args.webhook_id, args.apply, args.max_retries, stats,
+            removal_records=removal_records if track_removals else None,
+            bundle_meta=bundle_meta,
+            bundle_meta_path=meta_path,
+        )
 
         if args.apply:
             time.sleep(args.base_sleep + random.uniform(0, args.jitter))
@@ -656,13 +766,14 @@ def run_remove_walk_mode(args: argparse.Namespace, w: WorkspaceClient, stats: St
             logging.info("Reached --limit=%d, stopping.", args.limit)
             break
 
-    delta_table = getattr(args, "delta_table", None)
-    spark = getattr(args, "spark", None)
-    workspace_label = getattr(args, "workspace_label", None) or w.config.host
     if delta_table:
-        if spark is None:
+        if not args.apply:
+            logging.info("Dry-run: skipping write to Delta table %s (audit log is apply-only).",
+                         delta_table)
+        elif spark is None:
             raise SystemExit("delta_table requires a `spark` kwarg (the notebook's SparkSession).")
-        write_bundle_report_delta(spark, delta_table, bundle_records, workspace_label)
+        else:
+            write_removal_log_delta(spark, delta_table, removal_records, workspace_label)
     if args.bundle_report:
         write_bundle_report(args.bundle_report, bundle_records)
 
@@ -721,6 +832,11 @@ def run(
     Kwargs mirror `parse_args()` 1:1 for the CLI shape; notebook-only kwargs
     follow (`client`, `spark`, `delta_table`, `scan_limit`, `name_filter`,
     `workspace_label`). See the matching docstring on `inventory_jobs.run`.
+
+    `delta_table` is an apply-only audit log: one row per successful
+    `jobs.update`, with `is_bundle` + bundle metadata for bundle-managed jobs.
+    Both per-job and walk modes write to it. Dry-runs skip the write entirely.
+    `mode=append` so re-running the rollback adds rows, never clobbers history.
 
     `limit` (mutation cap) vs `scan_limit` (scan cap): `limit` stops the walk
     once N jobs have been would-updated / updated; `scan_limit` stops the walk

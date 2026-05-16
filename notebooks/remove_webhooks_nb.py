@@ -63,6 +63,9 @@ dbutils.widgets.dropdown("bundle_jobs", "skip", ["skip", "include", "only"],
 dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap)")
 dbutils.widgets.text("limit", "", "cap on jobs to update (empty = no cap)")
 
+# Output (Delta audit log)
+dbutils.widgets.text("catalog", "main", "UC catalog for the Delta audit log")
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -84,21 +87,6 @@ for u in WORKSPACE_URLS:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Output destination
-# MAGIC Edit the fully-qualified UC table below before running. This collects
-# MAGIC bundle-managed jobs encountered during a workspace walk (the rows
-# MAGIC bundle owners need to find which YAML to patch). Set to an empty string
-# MAGIC to disable. Unused in per-job mode.
-# MAGIC The SP must have `USE CATALOG`, `USE SCHEMA`, and `CREATE TABLE` on the
-# MAGIC target schema.
-
-# COMMAND ----------
-
-DELTA_TABLE = "main.webhook_rollout.bundle_jobs"
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC ## Read widget values
 # MAGIC All `dbutils.widgets.get(...)` calls happen here so you can see in one
 # MAGIC place what's being passed into the run.
@@ -115,6 +103,7 @@ owner_raw = dbutils.widgets.get("owner").strip()
 bundle_jobs = dbutils.widgets.get("bundle_jobs")
 scan_limit = dbutils.widgets.get("scan_limit").strip()
 limit = dbutils.widgets.get("limit").strip()
+catalog = dbutils.widgets.get("catalog").strip() or "main"
 
 # COMMAND ----------
 
@@ -128,6 +117,24 @@ print(f"owner:         {owner_raw!r}")
 print(f"bundle_jobs:   {bundle_jobs!r}")
 print(f"scan_limit:    {scan_limit!r}")
 print(f"limit:         {limit!r}")
+print(f"catalog:       {catalog!r}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Output destination
+# MAGIC Apply-only audit log of webhook removals — one row per successful
+# MAGIC `jobs.update`. Schema / table parts are hardcoded; the catalog comes
+# MAGIC from the `catalog` widget. The SP must have `USE CATALOG`, `USE SCHEMA`,
+# MAGIC and `CREATE TABLE` on the target schema. Dry-runs (`apply=false`)
+# MAGIC produce no rows. Mode is `append` — re-running the rollback adds
+# MAGIC history, never clobbers it. Set the cell to `DELTA_TABLE = ""` to
+# MAGIC disable the write entirely.
+
+# COMMAND ----------
+
+DELTA_TABLE = f"{catalog}.webhook_rollout.log_webhook_removals"
+print(f"DELTA_TABLE: {DELTA_TABLE}")
 
 # COMMAND ----------
 
@@ -254,7 +261,7 @@ print("\nDone.")
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- Inspect the bundle-jobs report written above (walk mode only).
-# MAGIC -- Edit the table name if you changed the DELTA_TABLE constant.
-# MAGIC SELECT * FROM main.webhook_rollout.bundle_jobs
+# Inspect the removal audit log written above. Resolves the table name from
+# DELTA_TABLE so it tracks the catalog widget — no manual edit needed when the
+# catalog changes.
+display(spark.sql(f"SELECT * FROM {DELTA_TABLE} ORDER BY deleted_at DESC"))

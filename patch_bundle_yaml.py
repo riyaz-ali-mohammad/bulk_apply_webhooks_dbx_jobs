@@ -71,6 +71,17 @@ def parse_args() -> argparse.Namespace:
         help="Limit to jobs whose `name:` field matches. Repeatable.",
     )
     p.add_argument("--tag", help="Filter by job-resource tag. Format: key=value, or just key.")
+    p.add_argument(
+        "--owner",
+        action="append",
+        default=[],
+        help=(
+            "Filter by `permissions:` entries on the job resource. Matches when an "
+            "entry has level IS_OWNER or CAN_MANAGE and one of `user_name`, "
+            "`service_principal_name`, or `group_name` equals the supplied value. "
+            "Repeatable for multiple owners (OR semantics)."
+        ),
+    )
     p.add_argument("--apply", action="store_true", help="Write files in place. Default: dry-run diff to stdout.")
     p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args()
@@ -138,7 +149,41 @@ def find_job_nodes(doc) -> Iterable[Tuple[str, CommentedMap]]:
                     yield f"targets.{tname}.resources.jobs.{name}", node
 
 
-def job_matches(job_node: CommentedMap, names: List[str], tag: Optional[Tuple[str, Optional[str]]]) -> bool:
+# `permissions:` levels that count as "owns the job" for the --owner filter.
+# IS_OWNER is the formal owner; CAN_MANAGE is included because many bundles
+# only set the latter (e.g. deploy SP, team group) and never set IS_OWNER.
+# CAN_VIEW and CAN_MANAGE_RUN are intentionally excluded — those are runtime
+# permissions, not ownership.
+_OWNER_LEVELS = frozenset({"IS_OWNER", "CAN_MANAGE"})
+_OWNER_PRINCIPAL_KEYS = ("user_name", "service_principal_name", "group_name")
+
+
+def _permissions_match_owner(job_node: CommentedMap, owners: List[str]) -> bool:
+    """True if `job_node.permissions` contains any IS_OWNER/CAN_MANAGE entry
+    whose user/SP/group name equals one of `owners`. OR-semantics across the
+    `owners` list."""
+    perms = job_node.get("permissions")
+    if not isinstance(perms, list):
+        return False
+    wanted = set(owners)
+    for entry in perms:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("level") not in _OWNER_LEVELS:
+            continue
+        for key in _OWNER_PRINCIPAL_KEYS:
+            principal = entry.get(key)
+            if isinstance(principal, str) and principal in wanted:
+                return True
+    return False
+
+
+def job_matches(
+    job_node: CommentedMap,
+    names: List[str],
+    tag: Optional[Tuple[str, Optional[str]]],
+    owners: Optional[List[str]] = None,
+) -> bool:
     if names:
         if job_node.get("name") not in names:
             return False
@@ -148,6 +193,9 @@ def job_matches(job_node: CommentedMap, names: List[str], tag: Optional[Tuple[st
         if not isinstance(tags, dict) or key not in tags:
             return False
         if val is not None and tags[key] != val:
+            return False
+    if owners:
+        if not _permissions_match_owner(job_node, owners):
             return False
     return True
 
@@ -234,6 +282,7 @@ def run(
     events: str = "on_failure,on_duration_warning_threshold_exceeded",
     job: Optional[List[str]] = None,
     tag: Optional[str] = None,
+    owner: Optional[List[str]] = None,
     apply: bool = False,
     verbose: bool = False,
 ) -> int:
@@ -243,7 +292,8 @@ def run(
     notebook layer has a single, stable contract.
 
     `webhook_id` is required (the CLI enforces `required=True` via argparse).
-    `job` is the repeatable `--job` filter; `tag` is the raw `key=value` string."""
+    `job` is the repeatable `--job` filter; `tag` is the raw `key=value` string;
+    `owner` is the repeatable `--owner` filter matched against `permissions:`."""
     if not webhook_id:
         raise SystemExit("webhook_id is required.")
     logging.basicConfig(
@@ -259,6 +309,7 @@ def run(
     parsed_events = parse_events(events)
     parsed_tag = parse_tag_filter(tag)
     job_names = list(job or [])
+    owner_filter = list(owner or [])
     yaml = make_yaml()
 
     with root_yaml.open() as f:
@@ -266,9 +317,9 @@ def run(
     files = discover_yaml_files(bundle_dir_path, root_doc)
 
     logging.info(
-        "Mode=%s bundle_dir=%s files=%d events=%s job_filter=%s tag=%s",
+        "Mode=%s bundle_dir=%s files=%d events=%s job_filter=%s tag=%s owners=%s",
         "APPLY" if apply else "DRY-RUN",
-        bundle_dir_path, len(files), parsed_events, job_names or None, tag,
+        bundle_dir_path, len(files), parsed_events, job_names or None, tag, owner_filter or None,
     )
 
     total_files_changed = 0
@@ -313,7 +364,7 @@ def run(
                         path.relative_to(bundle_dir_path), loc,
                     )
                 continue
-            if not job_matches(jnode, job_names, parsed_tag):
+            if not job_matches(jnode, job_names, parsed_tag, owner_filter):
                 continue
             total_jobs_matched += 1
             patched, var_skipped = patch_webhooks(jnode, webhook_id, parsed_events)

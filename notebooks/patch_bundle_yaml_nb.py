@@ -42,45 +42,96 @@
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Widgets
+
+# COMMAND ----------
+
+# Bundle target
 dbutils.widgets.text(
     "bundle_dir", "/Workspace/Repos/<user>/<repo>",
     "path to bundle root (contains databricks.yml)",
 )
+
+# Operation
 dbutils.widgets.text("webhook_id", "", "webhook destination ID to attach (required)")
 dbutils.widgets.text(
     "events",
     "on_failure,on_duration_warning_threshold_exceeded",
     "comma-separated event list",
 )
+dbutils.widgets.dropdown("apply", "false", ["false", "true"], "write files in place (vs dry-run diff)")
+
+# Filters
 dbutils.widgets.text("job", "", "filter by job `name:` field (comma-separated)")
 dbutils.widgets.text("tag", "", "filter by job-resource tag (key=value or key)")
-dbutils.widgets.dropdown("apply", "false", ["false", "true"], "write files in place (vs dry-run diff)")
+dbutils.widgets.text(
+    "owner", "",
+    "filter by `permissions:` (comma-separated user/SP/group; matches IS_OWNER or CAN_MANAGE)",
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Read widget values
+# MAGIC All `dbutils.widgets.get(...)` calls happen here so you can see in one
+# MAGIC place what's being passed into the run.
+
+# COMMAND ----------
+
+bundle_dir = dbutils.widgets.get("bundle_dir").strip()
+webhook_id = dbutils.widgets.get("webhook_id").strip()
+events = dbutils.widgets.get("events").strip()
+apply_flag = dbutils.widgets.get("apply")
+job_raw = dbutils.widgets.get("job").strip()
+tag = dbutils.widgets.get("tag").strip()
+owner_raw = dbutils.widgets.get("owner").strip()
+
+# COMMAND ----------
+
+print(f"bundle_dir: {bundle_dir!r}")
+print(f"webhook_id: {webhook_id!r}")
+print(f"events:     {events!r}")
+print(f"apply:      {apply_flag!r}")
+print(f"job:        {job_raw!r}")
+print(f"tag:        {tag!r}")
+print(f"owner:      {owner_raw!r}")
 
 # COMMAND ----------
 
 import os
 import sys
+import importlib.util
 
 notebook_dir = os.path.dirname(
     dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
 )
 repo_root = os.path.abspath(os.path.join("/Workspace" + notebook_dir, ".."))
-if repo_root not in sys.path:
-    sys.path.insert(0, repo_root)
 
-import patch_bundle_yaml
+# Load the top-level script by absolute path via importlib. The regular
+# `import patch_bundle_yaml` after sys.path insertion misbehaves in THIS
+# notebook specifically — empirically it raises ModuleNotFoundError even
+# though the file exists at repo_root + "/patch_bundle_yaml.py". The other
+# four notebooks in this repo don't hit it; the differentiator appears to be
+# this notebook's `dbutils.library.restartPython()` in cell 4 (needed for
+# the ruamel.yaml pip install). Root cause is not fully verified; the
+# importlib bypass sidesteps it entirely by not consulting sys.path.
+script_path = os.path.join(repo_root, "patch_bundle_yaml.py")
+spec = importlib.util.spec_from_file_location("patch_bundle_yaml_script", script_path)
+patch_bundle_yaml = importlib.util.module_from_spec(spec)
+sys.modules["patch_bundle_yaml_script"] = patch_bundle_yaml
+spec.loader.exec_module(patch_bundle_yaml)
 
-job_raw = dbutils.widgets.get("job").strip()
 kwargs = dict(
-    bundle_dir=dbutils.widgets.get("bundle_dir").strip(),
-    webhook_id=dbutils.widgets.get("webhook_id").strip(),
-    events=dbutils.widgets.get("events").strip(),
+    bundle_dir=bundle_dir,
+    webhook_id=webhook_id,
+    events=events,
     job=[j.strip() for j in job_raw.split(",") if j.strip()] if job_raw else [],
-    tag=dbutils.widgets.get("tag").strip() or None,
-    apply=dbutils.widgets.get("apply") == "true",
+    tag=tag or None,
+    owner=[o.strip() for o in owner_raw.split(",") if o.strip()] if owner_raw else [],
+    apply=apply_flag == "true",
     verbose=False,
 )
-print("Calling patch_bundle_yaml.run with:", kwargs)
 rc = patch_bundle_yaml.run(**kwargs)
 if rc != 0:
     raise SystemExit(rc)

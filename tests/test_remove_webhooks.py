@@ -99,29 +99,47 @@ class TestRemoveWebhooks:
         existing = WebhookNotifications(
             on_failure=[Webhook(id=WEBHOOK_ID), Webhook(id=OTHER_ID)],
         )
-        result, count = rmw.remove_webhooks(existing, WEBHOOK_ID)
+        result, count, ids, events = rmw.remove_webhooks(existing, WEBHOOK_ID)
         assert count == 1
         assert [w.id for w in result.on_failure] == [OTHER_ID]
+        assert ids == [WEBHOOK_ID]
+        assert events == ["on_failure"]
 
     def test_remove_all_clears_every_event_list(self):
         existing = WebhookNotifications(
             on_failure=[Webhook(id=WEBHOOK_ID)],
             on_success=[Webhook(id=OTHER_ID)],
         )
-        result, count = rmw.remove_webhooks(existing, None)
+        result, count, ids, events = rmw.remove_webhooks(existing, None)
         assert count == 2
         assert result.on_failure == []
         assert result.on_success == []
+        assert set(ids) == {WEBHOOK_ID, OTHER_ID}
+        assert set(events) == {"on_failure", "on_success"}
 
     def test_no_op_when_target_not_attached(self):
         existing = WebhookNotifications(on_failure=[Webhook(id=OTHER_ID)])
-        _, count = rmw.remove_webhooks(existing, WEBHOOK_ID)
+        _, count, ids, events = rmw.remove_webhooks(existing, WEBHOOK_ID)
         assert count == 0
+        assert ids == []
+        assert events == []
 
     def test_no_existing_returns_empty(self):
-        result, count = rmw.remove_webhooks(None, WEBHOOK_ID)
+        result, count, ids, events = rmw.remove_webhooks(None, WEBHOOK_ID)
         assert count == 0
         assert isinstance(result, WebhookNotifications)
+        assert ids == []
+        assert events == []
+
+    def test_ids_removed_dedups_when_same_id_on_multiple_events(self):
+        existing = WebhookNotifications(
+            on_failure=[Webhook(id=WEBHOOK_ID)],
+            on_success=[Webhook(id=WEBHOOK_ID)],
+        )
+        _, count, ids, events = rmw.remove_webhooks(existing, WEBHOOK_ID)
+        assert count == 2
+        assert ids == [WEBHOOK_ID]  # deduped across events
+        assert set(events) == {"on_failure", "on_success"}
 
 
 class TestWebhookAttached:
@@ -406,6 +424,147 @@ class TestRunCallable:
             progress_every=0,
         )
         assert rc == 0
+
+
+class TestRemovalLogDelta:
+    """Audit log: one Delta row per successful jobs.update. Apply-only;
+    dry-runs produce no rows."""
+
+    def _fake_spark(self):
+        """Mock that captures createDataFrame rows and the saveAsTable target."""
+        spark = MagicMock()
+        captured = {"rows": None, "table": None, "mode": None, "partitions": None}
+
+        def _create_df(rows):
+            captured["rows"] = rows
+            df = MagicMock()
+            writer = MagicMock()
+            df.write = writer
+            writer.format.return_value = writer
+            writer.mode.side_effect = lambda m: (captured.__setitem__("mode", m) or writer)
+            writer.option.return_value = writer
+            writer.partitionBy.side_effect = lambda *cols: (captured.__setitem__("partitions", cols) or writer)
+            writer.saveAsTable.side_effect = lambda t: captured.__setitem__("table", t)
+            return df
+
+        spark.createDataFrame.side_effect = _create_df
+        return spark, captured
+
+    def test_walk_writes_one_row_per_apply(self, monkeypatch):
+        jobs = [
+            _make_job(job_id=1, name="direct-job",
+                      webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)])),
+            _make_job(job_id=2, name="bundle-job",
+                      bundle=True, metadata_file_path="/meta",
+                      webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)])),
+        ]
+        w = MagicMock()
+        w.jobs.list.return_value = iter(jobs)
+        w.config.host = "https://test"
+        spark, captured = self._fake_spark()
+        # Stub bundle metadata fetch so the bundle row gets enriched.
+        monkeypatch.setattr(
+            rmw, "fetch_bundle_metadata",
+            lambda w, p, c: rmw.BundleMetadata(bundle_name="my-bundle", target="prod",
+                                                git_branch="main"),
+        )
+        rc = rmw.run(
+            client=w,
+            webhook_id=WEBHOOK_ID,
+            apply=True,
+            bundle_jobs="include",
+            bundle_report="",
+            progress_every=0,
+            delta_table="cat.schema.log_webhook_removals",
+            spark=spark,
+        )
+        assert rc == 0
+        assert captured["table"] == "cat.schema.log_webhook_removals"
+        assert captured["mode"] == "append"
+        assert captured["partitions"] == ("workspace_host",)
+        rows = captured["rows"]
+        assert len(rows) == 2
+        by_id = {r["job_id"]: r for r in rows}
+        # Direct job: is_bundle=False, no bundle metadata.
+        assert by_id[1]["is_bundle"] is False
+        assert by_id[1]["bundle_name"] == ""
+        assert by_id[1]["webhook_ids_removed"] == [WEBHOOK_ID]
+        assert by_id[1]["events_affected"] == ["on_failure"]
+        # Bundle job: is_bundle=True, metadata populated.
+        assert by_id[2]["is_bundle"] is True
+        assert by_id[2]["bundle_name"] == "my-bundle"
+        assert by_id[2]["target"] == "prod"
+        assert by_id[2]["git_branch"] == "main"
+        assert by_id[2]["metadata_file_path"] == "/meta"
+
+    def test_walk_dry_run_skips_delta_write(self, capfd):
+        """Dry-run + delta_table set must NOT produce any Spark writes.
+        Uses capfd because `rmw.run()` calls basicConfig(force=True) which
+        evicts caplog's handler — stderr capture survives it."""
+        jobs = [_make_job(job_id=1,
+                          webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)]))]
+        w = MagicMock()
+        w.jobs.list.return_value = iter(jobs)
+        w.config.host = "https://test"
+        spark, captured = self._fake_spark()
+        rmw.run(
+            client=w,
+            webhook_id=WEBHOOK_ID,
+            apply=False,
+            bundle_report="",
+            progress_every=0,
+            delta_table="cat.schema.log_webhook_removals",
+            spark=spark,
+        )
+        spark.createDataFrame.assert_not_called()
+        assert captured["table"] is None
+        assert "Dry-run: skipping write to Delta" in capfd.readouterr().err
+
+    def test_walk_errored_update_excluded_from_log(self, monkeypatch):
+        """A failed jobs.update must NOT produce an audit row — the log only
+        reflects deletions that actually happened."""
+        jobs = [_make_job(job_id=1,
+                          webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)]))]
+        w = MagicMock()
+        w.jobs.list.return_value = iter(jobs)
+        w.jobs.update.side_effect = Exception("boom")
+        w.config.host = "https://test"
+        spark, captured = self._fake_spark()
+        rmw.run(
+            client=w,
+            webhook_id=WEBHOOK_ID,
+            apply=True,
+            bundle_report="",
+            progress_every=0,
+            delta_table="cat.schema.log_webhook_removals",
+            spark=spark,
+        )
+        # Empty records list -> write_removal_log_delta short-circuits before createDataFrame.
+        spark.createDataFrame.assert_not_called()
+
+    def test_per_job_mode_also_writes_log(self):
+        w = MagicMock()
+        w.jobs.get.return_value = _make_job(
+            job_id=42, name="explicit-target",
+            webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)]),
+        )
+        w.config.host = "https://test"
+        spark, captured = self._fake_spark()
+        rc = rmw.run(
+            client=w,
+            webhook_id=WEBHOOK_ID,
+            job_id=[42],
+            apply=True,
+            bundle_report="",
+            progress_every=0,
+            delta_table="cat.schema.log_webhook_removals",
+            spark=spark,
+        )
+        assert rc == 0
+        assert captured["table"] == "cat.schema.log_webhook_removals"
+        assert len(captured["rows"]) == 1
+        assert captured["rows"][0]["job_id"] == 42
+        assert captured["rows"][0]["is_bundle"] is False
 
 
 class TestRunNotebookKwargs:

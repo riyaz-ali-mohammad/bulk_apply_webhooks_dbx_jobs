@@ -80,6 +80,85 @@ tags:
         assert patcher.job_matches(node, [], ("team", "other")) is False
         assert patcher.job_matches(node, [], ("missing", None)) is False
 
+    def test_owner_filter_matches_is_owner_user(self, yaml):
+        node = _load(yaml, """
+name: j
+permissions:
+  - level: IS_OWNER
+    user_name: alice@x.com
+""")
+        assert patcher.job_matches(node, [], None, ["alice@x.com"]) is True
+        assert patcher.job_matches(node, [], None, ["bob@x.com"]) is False
+
+    def test_owner_filter_matches_can_manage_group(self, yaml):
+        node = _load(yaml, """
+name: j
+permissions:
+  - level: CAN_MANAGE
+    group_name: data-platform
+""")
+        assert patcher.job_matches(node, [], None, ["data-platform"]) is True
+        assert patcher.job_matches(node, [], None, ["analytics"]) is False
+
+    def test_owner_filter_matches_can_manage_service_principal(self, yaml):
+        node = _load(yaml, """
+name: j
+permissions:
+  - level: CAN_MANAGE
+    service_principal_name: deploy-sp
+""")
+        assert patcher.job_matches(node, [], None, ["deploy-sp"]) is True
+
+    def test_owner_filter_ignores_can_view_and_can_manage_run(self, yaml):
+        """CAN_VIEW / CAN_MANAGE_RUN are runtime perms, not ownership — must NOT match."""
+        node = _load(yaml, """
+name: j
+permissions:
+  - level: CAN_VIEW
+    user_name: alice@x.com
+  - level: CAN_MANAGE_RUN
+    user_name: bob@x.com
+""")
+        assert patcher.job_matches(node, [], None, ["alice@x.com"]) is False
+        assert patcher.job_matches(node, [], None, ["bob@x.com"]) is False
+
+    def test_owner_filter_no_permissions_block(self, yaml):
+        node = _load(yaml, "name: j\n")
+        assert patcher.job_matches(node, [], None, ["alice@x.com"]) is False
+
+    def test_owner_filter_multiple_owners_or_semantics(self, yaml):
+        node = _load(yaml, """
+name: j
+permissions:
+  - level: IS_OWNER
+    user_name: alice@x.com
+""")
+        # Any of the listed owners matches → pass.
+        assert patcher.job_matches(node, [], None, ["bob@x.com", "alice@x.com"]) is True
+        assert patcher.job_matches(node, [], None, ["bob@x.com", "carol@x.com"]) is False
+
+    def test_owner_combines_with_other_filters_via_and(self, yaml):
+        """All supplied filters must match (AND across filter types)."""
+        node = _load(yaml, """
+name: alpha
+tags:
+  team: platform
+permissions:
+  - level: IS_OWNER
+    user_name: alice@x.com
+""")
+        assert patcher.job_matches(node, ["alpha"], ("team", "platform"), ["alice@x.com"]) is True
+        # name mismatch -> False even though owner+tag match
+        assert patcher.job_matches(node, ["beta"], ("team", "platform"), ["alice@x.com"]) is False
+        # owner mismatch -> False even though name+tag match
+        assert patcher.job_matches(node, ["alpha"], ("team", "platform"), ["bob@x.com"]) is False
+
+    def test_owner_empty_list_is_no_op(self, yaml):
+        """Empty/None owner filter should not exclude any job."""
+        node = _load(yaml, "name: j\n")
+        assert patcher.job_matches(node, [], None, []) is True
+        assert patcher.job_matches(node, [], None, None) is True
+
 
 # --------------------------------------------------------------------------- #
 # Non-DAB-style patching: base `resources.jobs.<name>` blocks

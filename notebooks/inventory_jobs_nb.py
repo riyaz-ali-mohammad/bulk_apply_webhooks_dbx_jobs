@@ -52,6 +52,9 @@ dbutils.widgets.dropdown("enrich_bundles", "false", ["false", "true"],
 # Performance
 dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap)")
 
+# Output (Delta inventory)
+dbutils.widgets.text("catalog", "main", "UC catalog for the Delta inventory")
+
 # COMMAND ----------
 
 # MAGIC %md
@@ -73,17 +76,6 @@ for u in WORKSPACE_URLS:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Output destination
-# MAGIC Edit the fully-qualified UC table below before running. The SP must have
-# MAGIC `USE CATALOG`, `USE SCHEMA`, and `CREATE TABLE` on the target schema.
-
-# COMMAND ----------
-
-DELTA_TABLE = "riz_catalog.webhook_rollout.jobs_inventory"
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC ## Read widget values
 # MAGIC All `dbutils.widgets.get(...)` calls happen here so you can see in one
 # MAGIC place what's being passed into the run.
@@ -95,6 +87,7 @@ tag = dbutils.widgets.get("tag").strip()
 owner_raw = dbutils.widgets.get("owner").strip()
 enrich_bundles = dbutils.widgets.get("enrich_bundles")
 scan_limit = dbutils.widgets.get("scan_limit").strip()
+catalog = dbutils.widgets.get("catalog").strip() or "main"
 
 # COMMAND ----------
 
@@ -103,6 +96,20 @@ print(f"tag:            {tag!r}")
 print(f"owner:          {owner_raw!r}")
 print(f"enrich_bundles: {enrich_bundles!r}")
 print(f"scan_limit:     {scan_limit!r}")
+print(f"catalog:        {catalog!r}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Output destination
+# MAGIC Schema / table parts are hardcoded; the catalog comes from the `catalog`
+# MAGIC widget. The SP must have `USE CATALOG`, `USE SCHEMA`, and `CREATE TABLE`
+# MAGIC on the target schema.
+
+# COMMAND ----------
+
+DELTA_TABLE = f"{catalog}.webhook_rollout.jobs_inventory"
+print(f"DELTA_TABLE: {DELTA_TABLE}")
 
 # COMMAND ----------
 
@@ -206,16 +213,12 @@ print(f"\nDone. SELECT * FROM {DELTA_TABLE}")
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC -- Inspect the inventory written above. Edit the table name if you
-# MAGIC -- changed the DELTA_TABLE constant.
-# MAGIC SELECT * FROM riz_catalog.webhook_rollout.jobs_inventory
+# Resolves the table name from DELTA_TABLE so it tracks the catalog widget.
+display(spark.sql(f"SELECT * FROM {DELTA_TABLE}"))
 
 # COMMAND ----------
 
-# MAGIC %sql
-# MAGIC SELECT workspace_host,count(*) FROM riz_catalog.webhook_rollout.jobs_inventory
-# MAGIC GROUP BY workspace_host
+display(spark.sql(f"SELECT workspace_host, count(*) AS jobs FROM {DELTA_TABLE} GROUP BY workspace_host"))
 
 # COMMAND ----------
 
