@@ -75,8 +75,7 @@ dbutils.widgets.text("limit", "", "cap on jobs to update (empty = no cap)")
 # COMMAND ----------
 
 WORKSPACE_URLS = [
-    # "https://adb-1234567890123456.7.azuredatabricks.net",
-    # "https://adb-9876543210987654.4.azuredatabricks.net",
+    'https://e2-demo-field-eng.cloud.databricks.com/'
 ]
 for u in WORKSPACE_URLS:
     print(u)
@@ -93,7 +92,7 @@ for u in WORKSPACE_URLS:
 
 # COMMAND ----------
 
-DELTA_TABLE = "main.webhook_rollout.bundle_jobs"
+DELTA_TABLE = "riz_catalog.webhook_rollout.bundle_jobs"
 
 # COMMAND ----------
 
