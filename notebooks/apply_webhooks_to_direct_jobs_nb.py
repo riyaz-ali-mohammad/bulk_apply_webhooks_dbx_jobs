@@ -51,8 +51,12 @@ dbutils.widgets.text("secret_scope", "webhook-rollout", "Databricks secret scope
 
 # Operation
 dbutils.widgets.text("webhook_id", "", "webhook destination ID (required)")
-dbutils.widgets.text("events", "on_failure,on_duration_warning_threshold_exceeded",
-    "comma-separated event list")
+dbutils.widgets.multiselect(
+    "events",
+    "on_failure,on_duration_warning_threshold_exceeded",
+    ["on_start", "on_success", "on_failure", "on_duration_warning_threshold_exceeded"],
+    "events to attach the webhook on (multi-select)",
+)
 dbutils.widgets.dropdown("apply", "false", ["false", "true"], "actually mutate (vs dry-run)")
 
 # Filters
