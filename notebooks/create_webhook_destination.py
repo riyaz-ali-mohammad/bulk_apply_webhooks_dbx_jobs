@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "1"
+# ///
 # MAGIC %md
 # MAGIC # Create Webhook Notification Destination (multi-workspace)
 # MAGIC
@@ -30,6 +34,11 @@
 
 # COMMAND ----------
 
+# %pip install -q databricks-sdk
+# dbutils.library.restartPython()
+
+# COMMAND ----------
+
 # Authentication
 dbutils.widgets.text("secret_scope", "webhook-rollout", "Databricks secret scope")
 
@@ -49,8 +58,8 @@ dbutils.widgets.dropdown("apply", "false", ["false", "true"], "actually create (
 # COMMAND ----------
 
 WORKSPACE_URLS = [
-    # "https://adb-1234567890123456.7.azuredatabricks.net",
-    # "https://adb-9876543210987654.4.azuredatabricks.net",
+    'https://e2-demo-field-eng.cloud.databricks.com/',
+    'https://e2-demo-west.cloud.databricks.com/'
 ]
 for u in WORKSPACE_URLS:
     print(u)
