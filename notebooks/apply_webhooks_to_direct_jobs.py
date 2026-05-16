@@ -1,10 +1,17 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Bulk-attach a Webhook Notification Destination on Jobs
+# MAGIC # Attach a Webhook Notification Destination to Direct (non-DAB) Jobs
 # MAGIC
 # MAGIC Walks the Jobs API across one or more target workspaces and attaches a
-# MAGIC webhook destination on every matching job. Default is **dry-run** —
-# MAGIC flip `apply=true` to actually mutate.
+# MAGIC webhook destination on every matching **non-DAB** job. Default is
+# MAGIC **dry-run** — flip `apply=true` to actually mutate.
+# MAGIC
+# MAGIC DAB-managed (Asset Bundle) jobs are **always skipped** — there is no
+# MAGIC widget to override this. `databricks bundle deploy` would silently
+# MAGIC overwrite API edits, so they belong to the patcher notebook
+# MAGIC (`notebooks/patch_bundle_yaml`). For an inventory of DAB jobs in a
+# MAGIC workspace, run `notebooks/inventory_jobs` and filter
+# MAGIC `WHERE deployment_kind = 'BUNDLE'`.
 # MAGIC
 # MAGIC For the rollback / detach path, see the companion notebook
 # MAGIC `notebooks/remove_webhooks`.
@@ -23,11 +30,6 @@
 # MAGIC - `scan_limit` caps the **walk itself** (jobs scanned, regardless of
 # MAGIC   matches). Use this for "touch only the first N jobs the workspace
 # MAGIC   returns" rollouts.
-# MAGIC
-# MAGIC ## Bundle-managed jobs
-# MAGIC `bundle_jobs=skip` (default) leaves DAB-managed jobs untouched; `bundle
-# MAGIC deploy` would otherwise silently overwrite the API edit. Use the patcher
-# MAGIC notebook for bundle-managed jobs.
 
 # COMMAND ----------
 
@@ -35,7 +37,7 @@
 # MAGIC No `%pip install` needed — this notebook only imports `databricks-sdk`,
 # MAGIC which is pre-installed in the Databricks runtime. Installing it again
 # MAGIC from PyPI would upgrade `protobuf` past the runtime's pinned version
-# MAGIC and break PySpark (the Delta write below).
+# MAGIC and break PySpark.
 
 # COMMAND ----------
 
@@ -56,8 +58,6 @@ dbutils.widgets.dropdown("apply", "false", ["false", "true"], "actually mutate (
 # Filters
 dbutils.widgets.text("tag", "", "tag filter (key=value or key)")
 dbutils.widgets.text("owner", "", "owner filter (comma-separated emails)")
-dbutils.widgets.dropdown("bundle_jobs", "skip", ["skip", "include", "only"],
-    "policy for DAB-managed jobs")
 
 # Performance
 dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap)")
@@ -75,24 +75,11 @@ dbutils.widgets.text("limit", "", "cap on jobs to update (empty = no cap)")
 # COMMAND ----------
 
 WORKSPACE_URLS = [
-    'https://e2-demo-field-eng.cloud.databricks.com/'
+    # "https://adb-1234567890123456.7.azuredatabricks.net",
+    # "https://adb-9876543210987654.4.azuredatabricks.net",
 ]
 for u in WORKSPACE_URLS:
     print(u)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Output destination
-# MAGIC Edit the fully-qualified UC table below before running. This collects the
-# MAGIC bundle-managed jobs encountered during the walk (the rows bundle owners
-# MAGIC need to find which YAML to patch). Set to an empty string to disable.
-# MAGIC The SP must have `USE CATALOG`, `USE SCHEMA`, and `CREATE TABLE` on the
-# MAGIC target schema.
-
-# COMMAND ----------
-
-DELTA_TABLE = "riz_catalog.webhook_rollout.bundle_jobs"
 
 # COMMAND ----------
 
@@ -109,7 +96,6 @@ events = dbutils.widgets.get("events").strip()
 apply_flag = dbutils.widgets.get("apply")
 tag = dbutils.widgets.get("tag").strip()
 owner_raw = dbutils.widgets.get("owner").strip()
-bundle_jobs = dbutils.widgets.get("bundle_jobs")
 scan_limit = dbutils.widgets.get("scan_limit").strip()
 limit = dbutils.widgets.get("limit").strip()
 
@@ -121,7 +107,6 @@ print(f"events:        {events!r}")
 print(f"apply:         {apply_flag!r}")
 print(f"tag:           {tag!r}")
 print(f"owner:         {owner_raw!r}")
-print(f"bundle_jobs:   {bundle_jobs!r}")
 print(f"scan_limit:    {scan_limit!r}")
 print(f"limit:         {limit!r}")
 
@@ -180,7 +165,7 @@ for p in (repo_root, notebooks_dir):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import bulk_apply_webhooks
+import apply_webhooks_to_direct_jobs
 import _auth
 
 
@@ -198,8 +183,6 @@ shared_kwargs = dict(
     events=events,
     tag=tag or None,
     owner=_parse_csv_strs(owner_raw),
-    bundle_jobs=bundle_jobs,
-    bundle_report="",  # CSV disabled in notebook mode
     apply=apply_flag == "true",
     profile=None,
     max_retries=MAX_RETRIES,
@@ -208,8 +191,6 @@ shared_kwargs = dict(
     limit=_optional_int(limit),
     progress_every=PROGRESS_EVERY,
     verbose=False,
-    spark=spark,
-    delta_table=DELTA_TABLE or None,
     scan_limit=_optional_int(scan_limit),
 )
 
@@ -228,7 +209,7 @@ errors = []
 for w in clients:
     print(f"\n=== {w.config.host} ===")
     try:
-        rc = bulk_apply_webhooks.run(client=w, workspace_label=w.config.host, **shared_kwargs)
+        rc = apply_webhooks_to_direct_jobs.run(client=w, workspace_label=w.config.host, **shared_kwargs)
         if rc != 0:
             errors.append((w.config.host, f"run returned {rc}"))
     except Exception as e:
@@ -241,10 +222,3 @@ if errors:
         print(f"  {host}: {err}")
     raise SystemExit(1)
 print("\nDone.")
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC -- Inspect the bundle-jobs report written above. Edit the table name if
-# MAGIC -- you changed the DELTA_TABLE constant.
-# MAGIC SELECT * FROM main.webhook_rollout.bundle_jobs

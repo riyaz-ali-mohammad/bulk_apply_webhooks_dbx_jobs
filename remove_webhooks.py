@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Remove (detach) a Databricks webhook notification destination from jobs.
 
-Companion to bulk_apply_webhooks.py — separates the rollback / detach path from
-the bulk-attach path so each script has a single, clear purpose.
+Companion to apply_webhooks_to_direct_jobs.py — separates the rollback /
+detach path from the bulk-attach path so each script has a single, clear
+purpose. Unlike the attach script, this one CAN detach from DAB-managed jobs
+(useful for cleaning up stale references before re-patching via
+patch_bundle_yaml); see `--bundle-jobs` below.
 
 Three shapes (the script picks based on which flags are passed):
   (1) Per-job rollback: pair with --job-id / --job-ids-from to detach from
@@ -57,7 +60,7 @@ from databricks.sdk.service.jobs import (
 
 
 # Event fields the Jobs API recognizes on `webhook_notifications`.
-# Duplicated with bulk_apply_webhooks.py per the project's "no shared module
+# Duplicated with apply_webhooks_to_direct_jobs.py per the project's "no shared module
 # between the four scripts" convention (see CLAUDE.md).
 EVENT_FIELDS = (
     "on_start",

@@ -2,7 +2,7 @@
 # MAGIC %md
 # MAGIC # Remove (detach) a Webhook Notification Destination from Jobs
 # MAGIC
-# MAGIC Companion to `bulk_apply_webhooks` — the rollback / detach path. Default
+# MAGIC Companion to `apply_webhooks_to_direct_jobs` — the rollback / detach path. Default
 # MAGIC is **dry-run** — flip `apply=true` to actually mutate.
 # MAGIC
 # MAGIC ## Multi-workspace + SP auth

@@ -9,7 +9,7 @@ notebooks/
 ├── _auth.py                       (helper — do not run directly)
 ├── inventory_jobs.py              read-only: list jobs, classify BUNDLE vs DIRECT, write Delta
 ├── create_webhook_destination.py  create the webhook destination (idempotent on display_name)
-├── bulk_apply_webhooks.py         attach the destination to direct-deployed jobs
+├── apply_webhooks_to_direct_jobs.py  attach the destination to direct-deployed jobs (DAB jobs always skipped)
 ├── remove_webhooks.py             detach the destination from jobs (rollback / cleanup)
 └── patch_bundle_yaml.py           edit DAB YAML in place for bundle-managed jobs
 ```
@@ -73,19 +73,21 @@ Defaults assumed by every notebook:
 Each notebook runs a preflight cell that lists the scope and fails fast with a
 clear error if either key is missing.
 
-### 3. UC schema for Delta output (`inventory_jobs`, `bulk_apply_webhooks`, `remove_webhooks`)
+### 3. UC schema for Delta output (`inventory_jobs`, `remove_webhooks`)
 
-These three notebooks write to a Delta table. The SP needs `USE CATALOG`,
+Two of the notebooks write to a Delta table. The SP needs `USE CATALOG`,
 `USE SCHEMA`, and `CREATE TABLE` on the target schema. Defaults:
 
 | Notebook              | Default table                              |
 |-----------------------|--------------------------------------------|
 | `inventory_jobs`      | `main.webhook_rollout.jobs_inventory`      |
-| `bulk_apply_webhooks` | `main.webhook_rollout.bundle_jobs`         |
-| `remove_webhooks`     | `main.webhook_rollout.bundle_jobs` (walk mode only — same schema, same partition column) |
+| `remove_webhooks`     | `main.webhook_rollout.bundle_jobs` (walk mode only — bundle jobs encountered during rollback) |
 
-All three are set as `DELTA_TABLE = "..."` Python constants near the top of
-each notebook — edit them to your catalog/schema before the first run.
+Both are set as `DELTA_TABLE = "..."` Python constants near the top of each
+notebook — edit them to your catalog/schema before the first run.
+
+`apply_webhooks_to_direct_jobs` produces **no Delta output** — it always
+skips DAB jobs and never fetches their metadata.
 
 ### 4. Check out this repo as a Databricks Git folder
 
@@ -128,10 +130,10 @@ inventory_jobs                     ← read-only, size up the work
 create_webhook_destination         ← idempotent; creates the destination
        │
        ▼
-bulk_apply_webhooks (dry-run)      ← preview what would change
+apply_webhooks_to_direct_jobs (dry-run)      ← preview what would change
        │
        ▼
-bulk_apply_webhooks (apply=true)   ← attaches to DIRECT-deployed jobs
+apply_webhooks_to_direct_jobs (apply=true)   ← attaches to DIRECT-deployed jobs only
        │
        ▼
 patch_bundle_yaml                  ← for BUNDLE-deployed jobs, separate flow
@@ -139,13 +141,15 @@ patch_bundle_yaml                  ← for BUNDLE-deployed jobs, separate flow
 remove_webhooks                    ← off-cycle: rollback / cleanup
 ```
 
-`bulk_apply_webhooks` defaults to **skipping bundle-managed jobs** because
-`databricks bundle deploy` would silently overwrite an API edit. The patcher
-notebook is the durable path for those.
+`apply_webhooks_to_direct_jobs` **always** skips bundle-managed jobs (no flag
+to override) because `databricks bundle deploy` would silently overwrite the
+API edit. The patcher notebook is the durable path for those.
 
-`remove_webhooks` is the inverse of `bulk_apply_webhooks` — same multi-workspace
-shape, same bundle policy, opposite operation. Run it when a rollout needs to
-be reversed.
+`remove_webhooks` is the inverse of `apply_webhooks_to_direct_jobs` — same
+multi-workspace shape, opposite operation. Unlike the attach notebook, it CAN
+operate on bundle jobs via the `bundle_jobs` widget (useful for cleaning up
+stale references before re-patching). Run it when a rollout needs to be
+reversed.
 
 ---
 
@@ -202,15 +206,16 @@ present in the older SDK shipped on the Databricks runtime. See the comment
 at the top of `../create_webhook_destination.py` for context.
 
 **Outputs**: the destination ID for each workspace, printed to cell output.
-Feed this into the `webhook_id` widget of `bulk_apply_webhooks`.
+Feed this into the `webhook_id` widget of `apply_webhooks_to_direct_jobs`.
 
-## 3. `bulk_apply_webhooks` — attach
+## 3. `apply_webhooks_to_direct_jobs` — attach (DIRECT jobs only)
 
 Walks the Jobs API across each workspace and attaches the destination to
-matching `DIRECT` jobs. Bundle-managed jobs are skipped by default; they're
-inventoried to the bundle-jobs Delta table so bundle owners can pick them up
-via `patch_bundle_yaml`. For the rollback / detach path, see `remove_webhooks`
-below.
+matching `DIRECT` jobs. Bundle-managed (DAB) jobs are **always skipped** —
+there is no widget to override. For the bundle path, use the
+`patch_bundle_yaml` notebook; to find the bundles that need patching, run
+`inventory_jobs` and filter `WHERE deployment_kind = 'BUNDLE'`. For the
+rollback / detach path, see `remove_webhooks` below.
 
 Widgets:
 
@@ -222,20 +227,21 @@ Widgets:
 | `apply`         | `false` = dry-run. `true` = actually mutate.                  |
 | `tag`           | Tag filter (`key=value` or `key`)                             |
 | `owner`         | Comma-separated creator emails                                |
-| `bundle_jobs`   | `skip` (default) / `include` / `only`                         |
 | `scan_limit`    | Hard cap on jobs scanned (empty = no cap)                     |
 | `limit`         | Hard cap on jobs **mutated** (different from `scan_limit` — see "gotchas") |
 
 To run:
-1. Edit `WORKSPACE_URLS` and `DELTA_TABLE` cells.
+1. Edit `WORKSPACE_URLS`.
 2. Set `webhook_id` from step 2.
 3. Run with `apply=false` first — produces the "would update N jobs" dry-run
-   log and writes the bundle-jobs inventory.
+   log. Bundle jobs encountered during the walk are logged with
+   `SKIP bundle-managed` and counted under `bundle_skipped` in the final
+   stats line.
 4. Re-run with `apply=true` to attach.
 
 ## 4. `remove_webhooks` — detach (rollback / cleanup)
 
-Inverse of `bulk_apply_webhooks`. Two shapes, picked automatically from which
+Inverse of `apply_webhooks_to_direct_jobs`. Two shapes, picked automatically from which
 widgets you fill in:
 
 - **Per-job rollback**: set `job_id` and/or `job_ids_from`. `webhook_id`
@@ -267,8 +273,8 @@ To run a workspace-wide rollback (most common shape):
    detached without mutating anything.
 3. Re-run with `apply=true`.
 
-To roll back a specific list of jobs from `bundle_jobs.csv` /
-`jobs_inventory.csv`:
+To roll back a specific list of jobs from `jobs_inventory.csv` (or the
+`bundle_jobs.csv` produced by a prior `remove_webhooks` walk-mode run):
 1. Upload the CSV to a UC Volume (e.g. `/Volumes/main/webhook_rollout/csvs/jobs.csv`).
 2. Set `job_ids_from=/Volumes/.../jobs.csv` and (optionally) `webhook_id` to
    limit the removal to that specific destination.
@@ -328,7 +334,7 @@ Patcher caveats (the notebook handles all three; documented in detail in the
 
 ### `scan_limit` vs `limit`
 
-`bulk_apply_webhooks` exposes both, and they're not interchangeable:
+`apply_webhooks_to_direct_jobs` exposes both, and they're not interchangeable:
 
 - **`scan_limit`** caps the **walk itself** — stops after N jobs scanned,
   regardless of how many matched. Use this when you want "touch only the
@@ -345,7 +351,7 @@ Use `scan_limit` if you wanted the walk to stop early.
 
 The Databricks runtime ships an older SDK (verified `0.20.0` on the
 workspace we tested against). Two consequences:
-- `inventory_jobs`, `bulk_apply_webhooks`, `remove_webhooks`, and
+- `inventory_jobs`, `apply_webhooks_to_direct_jobs`, `remove_webhooks`, and
   `create_webhook_destination` **do not** `%pip install databricks-sdk`.
   Installing it upgrades `protobuf` past the runtime's pinned version and
   breaks PySpark (which the Delta writes need). The notebooks rely on

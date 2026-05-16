@@ -1,34 +1,39 @@
 #!/usr/bin/env python3
-"""Bulk-attach a Databricks webhook notification destination to jobs in a workspace.
+"""Attach a Databricks webhook notification destination to non-DAB jobs in a workspace.
+
+Walks the Jobs API and attaches the supplied webhook to every matching job
+whose `settings.deployment.kind` is NOT `BUNDLE`. DAB-managed (Asset Bundle)
+jobs are **always** skipped — `databricks bundle deploy` would silently
+overwrite API edits, so they belong to the patcher (`patch_bundle_yaml.py`).
+For an inventory of DAB-deployed jobs in a workspace, use `inventory_jobs.py`
+and filter `WHERE deployment_kind = 'BUNDLE'`.
+
+For the rollback / detach path, see the companion script `remove_webhooks.py`.
 
 Auth follows the standard Databricks SDK credential chain:
   - env vars DATABRICKS_HOST + DATABRICKS_TOKEN, or
   - DATABRICKS_CONFIG_PROFILE / --profile, or
   - OAuth via `databricks auth login`.
 
-For the rollback / detach path, see the companion script `remove_webhooks.py`.
-
 Examples:
-  # Dry-run against every job in the workspace
-  python bulk_apply_webhooks.py --webhook-id 0123abcd
+  # Dry-run against every non-DAB job in the workspace
+  python apply_webhooks_to_direct_jobs.py --webhook-id 0123abcd
 
   # Apply to jobs tagged team=platform
-  python bulk_apply_webhooks.py --webhook-id 0123abcd --tag team=platform --apply
+  python apply_webhooks_to_direct_jobs.py --webhook-id 0123abcd --tag team=platform --apply
 
   # Staged rollout: cap to 25 owner-filtered jobs, then re-run for the rest
-  python bulk_apply_webhooks.py --webhook-id 0123abcd \
+  python apply_webhooks_to_direct_jobs.py --webhook-id 0123abcd \
       --owner alice@example.com --owner bob@example.com --limit 25 --apply
 """
 
 import argparse
-import csv
-import json
 import logging
 import random
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import DatabricksError
@@ -66,26 +71,6 @@ class Stats:
     errored: int = 0
 
 
-@dataclass
-class BundleMetadata:
-    bundle_name: Optional[str] = None
-    target: Optional[str] = None
-    git_origin: Optional[str] = None
-    git_branch: Optional[str] = None
-    git_commit: Optional[str] = None
-    workspace_root: Optional[str] = None
-    workspace_file_path: Optional[str] = None
-
-
-@dataclass
-class BundleJobRecord:
-    job_id: int
-    name: str
-    metadata_file_path: Optional[str]
-    creator: Optional[str]
-    metadata: Optional[BundleMetadata] = None
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
@@ -110,22 +95,6 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Filter by creator_user_name. Repeatable for multiple owners.",
-    )
-    p.add_argument(
-        "--bundle-jobs",
-        choices=("skip", "include", "only"),
-        default="skip",
-        help=(
-            "Policy for Asset-Bundle-deployed jobs (settings.deployment.kind == BUNDLE). "
-            "skip (default): leave them alone, since `bundle deploy` will overwrite API edits. "
-            "include: write through anyway (rare; you must also patch the bundle YAML). "
-            "only: process bundle jobs exclusively (useful for auditing)."
-        ),
-    )
-    p.add_argument(
-        "--bundle-report",
-        default="bundle_jobs.csv",
-        help="CSV path to write the list of bundle-managed jobs encountered. Set to '' to disable.",
     )
     p.add_argument("--apply", action="store_true", help="Actually call jobs/update. Default is dry-run.")
     p.add_argument("--profile", help="Databricks CLI profile name.")
@@ -172,53 +141,12 @@ def parse_events(s: str) -> List[str]:
     return events
 
 
-def _dig(d, *keys):
-    cur = d
-    for k in keys:
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(k)
-    return cur
-
-
-def fetch_bundle_metadata(
-    w: WorkspaceClient,
-    path: Optional[str],
-    cache: Dict[str, Optional[BundleMetadata]],
-) -> Optional[BundleMetadata]:
-    """Read and parse the bundle deployment metadata JSON from the workspace. Cached per-path."""
-    if not path:
-        return None
-    if path in cache:
-        return cache[path]
-    try:
-        with w.workspace.download(path) as fh:
-            data = json.load(fh)
-    except Exception as e:
-        logging.warning("Could not read bundle metadata at %s: %s", path, e)
-        cache[path] = None
-        return None
-
-    cfg = data.get("config") if isinstance(data, dict) else None
-    if not isinstance(cfg, dict):
-        # Some metadata variants put fields at top level; try both.
-        cfg = data if isinstance(data, dict) else {}
-
-    md = BundleMetadata(
-        bundle_name=_dig(cfg, "bundle", "name"),
-        target=_dig(cfg, "bundle", "target"),
-        git_origin=_dig(cfg, "bundle", "git", "origin_url") or _dig(cfg, "bundle", "git", "OriginURL"),
-        git_branch=_dig(cfg, "bundle", "git", "branch") or _dig(cfg, "bundle", "git", "Branch"),
-        git_commit=_dig(cfg, "bundle", "git", "commit") or _dig(cfg, "bundle", "git", "Commit"),
-        workspace_root=_dig(cfg, "workspace", "root_path"),
-        workspace_file_path=_dig(cfg, "workspace", "file_path"),
-    )
-    cache[path] = md
-    return md
-
-
 def is_bundle_job(job: BaseJob) -> Tuple[bool, Optional[str]]:
-    """Return (is_bundle, metadata_file_path). Detected via settings.deployment.kind == BUNDLE."""
+    """Return (is_bundle, metadata_file_path). Detected via settings.deployment.kind == BUNDLE.
+
+    metadata_file_path is returned for completeness — this script never reads it,
+    since DAB jobs are always skipped. The tuple shape mirrors the helper in
+    inventory_jobs.py / remove_webhooks.py so the same test-fixture shape works."""
     s = job.settings
     if not s or not getattr(s, "deployment", None):
         return False, None
@@ -226,70 +154,6 @@ def is_bundle_job(job: BaseJob) -> Tuple[bool, Optional[str]]:
     kind_str = getattr(kind, "value", None) or str(kind) if kind is not None else ""
     is_bundle = "BUNDLE" in kind_str.upper()
     return is_bundle, getattr(s.deployment, "metadata_file_path", None)
-
-
-def write_bundle_report(path: str, records: List[BundleJobRecord]) -> None:
-    if not path or not records:
-        return
-    columns = [
-        "job_id", "name", "creator",
-        "bundle_name", "target",
-        "git_origin", "git_branch", "git_commit",
-        "workspace_root", "workspace_file_path",
-        "metadata_file_path",
-    ]
-    with open(path, "w", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(columns)
-        for r in records:
-            md = r.metadata or BundleMetadata()
-            writer.writerow([
-                r.job_id, r.name, r.creator or "",
-                md.bundle_name or "", md.target or "",
-                md.git_origin or "", md.git_branch or "", md.git_commit or "",
-                md.workspace_root or "", md.workspace_file_path or "",
-                r.metadata_file_path or "",
-            ])
-    logging.info("Wrote %d bundle-job records to %s", len(records), path)
-
-
-def write_bundle_report_delta(spark, table: str, records: List[BundleJobRecord], workspace_label: str) -> None:
-    """Write bundle-job records to a Delta table partitioned by workspace_host.
-    Per-workspace re-runs replace only that workspace's partition. See the
-    matching helper in inventory_jobs.py for partition-overwrite rationale."""
-    if not records:
-        logging.info("No bundle records to write to %s.", table)
-        return
-    import datetime
-    scanned_at = datetime.datetime.now(datetime.timezone.utc)
-    rows = []
-    for r in records:
-        md = r.metadata or BundleMetadata()
-        rows.append({
-            "workspace_host": workspace_label,
-            "scanned_at": scanned_at,
-            "job_id": r.job_id,
-            "name": r.name,
-            "creator": r.creator or "",
-            "bundle_name": md.bundle_name or "",
-            "target": md.target or "",
-            "git_origin": md.git_origin or "",
-            "git_branch": md.git_branch or "",
-            "git_commit": md.git_commit or "",
-            "workspace_root": md.workspace_root or "",
-            "workspace_file_path": md.workspace_file_path or "",
-            "metadata_file_path": r.metadata_file_path or "",
-        })
-    df = spark.createDataFrame(rows)
-    (df.write
-        .format("delta")
-        .mode("overwrite")
-        .option("partitionOverwriteMode", "dynamic")
-        .option("mergeSchema", "true")
-        .partitionBy("workspace_host")
-        .saveAsTable(table))
-    logging.info("Wrote %d bundle-job records to Delta table %s (workspace_host=%s)",
-                 len(records), table, workspace_label)
 
 
 def job_matches(job: BaseJob, f: Filters) -> bool:
@@ -411,8 +275,6 @@ def run(
     events: str = "on_failure,on_duration_warning_threshold_exceeded",
     tag: Optional[str] = None,
     owner: Optional[List[str]] = None,
-    bundle_jobs: str = "skip",
-    bundle_report: str = "bundle_jobs.csv",
     apply: bool = False,
     profile: Optional[str] = None,
     max_retries: int = 5,
@@ -422,8 +284,6 @@ def run(
     progress_every: int = 500,
     verbose: bool = False,
     client=None,
-    spark=None,
-    delta_table: Optional[str] = None,
     scan_limit: Optional[int] = None,
     name_filter: Optional[str] = None,
     workspace_label: Optional[str] = None,
@@ -431,21 +291,22 @@ def run(
     """Library entry point. Notebooks import this and map widgets → kwargs.
 
     Kwargs mirror `parse_args()` 1:1 for the CLI shape; notebook-only kwargs
-    follow (`client`, `spark`, `delta_table`, `scan_limit`, `name_filter`,
-    `workspace_label`). See the docstring on `inventory_jobs.run` for the
-    semantics — they match.
+    follow (`client`, `scan_limit`, `name_filter`, `workspace_label`).
 
     `limit` (mutation cap) and `scan_limit` (scan cap) are distinct: `limit`
     stops the loop once N jobs would-update / updated; `scan_limit` stops the
     walk after N jobs scanned regardless of matches. When matches are sparse,
-    `limit` alone won't shorten the scan — set `scan_limit` for that."""
+    `limit` alone won't shorten the scan — set `scan_limit` for that.
+
+    DAB-managed jobs are always skipped (counted in `stats.bundle_skipped`).
+    There is no `--bundle-jobs` flag — that escape hatch was removed because
+    API edits to bundle jobs are non-durable across `databricks bundle deploy`.
+    Use `patch_bundle_yaml.py` for the bundle path."""
     args = argparse.Namespace(
         webhook_id=webhook_id,
         events=events,
         tag=tag,
         owner=list(owner or []),
-        bundle_jobs=bundle_jobs,
-        bundle_report=bundle_report,
         apply=apply,
         profile=profile,
         max_retries=max_retries,
@@ -456,8 +317,6 @@ def run(
         verbose=verbose,
         scan_limit=scan_limit,
         name_filter=name_filter,
-        delta_table=delta_table,
-        spark=spark,
         workspace_label=workspace_label,
     )
     _validate_run_kwargs(args)
@@ -469,16 +328,13 @@ def run(
 
     parsed_events = parse_events(args.events)
     filters = parse_filters(args)
-    bundle_records: List[BundleJobRecord] = []
-    bundle_meta_cache: Dict[str, Optional[BundleMetadata]] = {}
 
     logging.info(
-        "Mode=%s webhook=%s events=%s tag=%s owners=%s bundle_jobs=%s limit=%s scan_limit=%s name_filter=%s",
+        "Mode=%s webhook=%s events=%s tag=%s owners=%s limit=%s scan_limit=%s name_filter=%s",
         "APPLY" if args.apply else "DRY-RUN",
         args.webhook_id, parsed_events,
         f"{filters.tag_key}={filters.tag_value}" if filters.tag_key else None,
         filters.owners or None,
-        args.bundle_jobs,
         args.limit,
         args.scan_limit,
         args.name_filter,
@@ -502,25 +358,15 @@ def run(
             continue
         stats.matched += 1
 
-        bundle, meta_path = is_bundle_job(job)
         name = (job.settings.name if job.settings else None) or "<unnamed>"
-
+        bundle, _meta_path = is_bundle_job(job)
         if bundle:
-            md = fetch_bundle_metadata(w, meta_path, bundle_meta_cache)
-            bundle_records.append(BundleJobRecord(
-                job_id=job.job_id, name=name,
-                metadata_file_path=meta_path, creator=job.creator_user_name,
-                metadata=md,
-            ))
-            if args.bundle_jobs == "skip":
-                stats.bundle_skipped += 1
-                logging.info("Job %s (%s): SKIP bundle-managed (deploy will clobber API edits). meta=%s",
-                             job.job_id, name, meta_path)
-                continue
-        else:
-            if args.bundle_jobs == "only":
-                logging.debug("Job %s (%s): skipping non-bundle job (--bundle-jobs=only).", job.job_id, name)
-                continue
+            stats.bundle_skipped += 1
+            logging.info(
+                "Job %s (%s): SKIP bundle-managed (use patch_bundle_yaml for DAB jobs).",
+                job.job_id, name,
+            )
+            continue
 
         process_job(w, job, args.webhook_id, parsed_events, args.apply, args.max_retries, stats)
 
@@ -531,17 +377,10 @@ def run(
             logging.info("Reached --limit=%d, stopping.", args.limit)
             break
 
-    if args.delta_table:
-        if args.spark is None:
-            raise SystemExit("delta_table requires a `spark` kwarg (the notebook's SparkSession).")
-        write_bundle_report_delta(args.spark, args.delta_table, bundle_records, args.workspace_label)
-    if args.bundle_report:
-        write_bundle_report(args.bundle_report, bundle_records)
-
     logging.info(
-        "Done. scanned=%d matched=%d already_attached=%d bundle_skipped=%d would_update=%d updated=%d errored=%d bundle_total=%d",
+        "Done. scanned=%d matched=%d already_attached=%d bundle_skipped=%d would_update=%d updated=%d errored=%d",
         stats.scanned, stats.matched, stats.already_attached, stats.bundle_skipped,
-        stats.would_update, stats.updated, stats.errored, len(bundle_records),
+        stats.would_update, stats.updated, stats.errored,
     )
     return 1 if stats.errored else 0
 

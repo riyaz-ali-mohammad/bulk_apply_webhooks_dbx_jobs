@@ -1,11 +1,12 @@
 # Bulk Apply Webhook Notifications to Databricks Jobs
 
-Four Python scripts for rolling out a webhook-based Notification Destination across every job in a Databricks workspace:
+Five Python scripts for rolling out a webhook-based Notification Destination across every job in a Databricks workspace:
 
-1. **`inventory_jobs.py`** — read-only discovery. Walks the Jobs API and reports how many jobs are in the workspace and how many are DAB-deployed versus directly-deployed. Run this first when assessing a new workspace; the CSV it writes feeds steps 3 and 4.
+1. **`inventory_jobs.py`** — read-only discovery. Walks the Jobs API and reports how many jobs are in the workspace and how many are DAB-deployed versus directly-deployed. Run this first when assessing a new workspace.
 2. **`create_webhook_destination.py`** — one-shot setup. Creates a generic-webhook Notification Destination from a URL, so you can skip the Admin Settings UI. Idempotent on display name.
-3. **`bulk_apply_webhooks.py`** — workspace-side script. Walks every job via the Jobs API, attaches the webhook to manually-created jobs, and inventories bundle-managed jobs for hand-off (because API edits to bundle jobs are non-durable).
-4. **`patch_bundle_yaml.py`** — companion script. Runs on a local checkout of a bundle repo, edits the bundle YAML in place to add `webhook_notifications` to job resources, producing a review-ready git diff. This is the durable fix for bundle-managed jobs.
+3. **`apply_webhooks_to_direct_jobs.py`** — workspace-side attach script. Walks every job via the Jobs API and attaches the webhook to non-DAB jobs. DAB-managed (Asset Bundle) jobs are **always skipped** — there is no flag to override; patch the bundle YAML via `patch_bundle_yaml.py` instead.
+4. **`remove_webhooks.py`** — rollback / detach companion. Same multi-workspace shape; two modes (per-job by ID, or workspace-walk by webhook ID). Unlike the attach script, this one CAN operate on DAB jobs via `--bundle-jobs` (useful for cleaning up stale references before re-patching).
+5. **`patch_bundle_yaml.py`** — companion script. Runs on a local checkout of a bundle repo, edits the bundle YAML in place to add `webhook_notifications` to job resources, producing a review-ready git diff. This is the durable fix for bundle-managed jobs.
 
 All mutating scripts default to dry-run and are idempotent. `inventory_jobs.py` is read-only by design. The inventory, bulk, and patch scripts support tag/owner filters for staged rollout.
 
@@ -16,7 +17,7 @@ All mutating scripts default to dry-run and are idempotent. `inventory_jobs.py` 
 Read-only discovery step. Use this when you've been pointed at a new workspace and need to understand the shape of it before planning a rollout — in particular, how many jobs need each of the two follow-up scripts.
 
 - Walks `GET /api/2.2/jobs/list` (paginated).
-- Classifies each job using the same check as `bulk_apply_webhooks.py`: `settings.deployment.kind == BUNDLE` ⇒ DAB-deployed, otherwise directly-deployed.
+- Classifies each job using the same check as `apply_webhooks_to_direct_jobs.py`: `settings.deployment.kind == BUNDLE` ⇒ DAB-deployed, otherwise directly-deployed.
 - Prints a short summary to stdout: total, `DAB-deployed`, `directly-deployed`, and top-N breakdowns by creator and (with `--enrich-bundles`) by bundle name.
 - Writes `jobs_inventory.csv` — every job with a `deployment_kind` column up front. Disable via `--output ''`.
 - `--enrich-bundles` reads each unique bundle's `metadata.json` from `/Workspace` to populate `bundle_name`, `target`, and `git_*` columns. Off by default because it adds one workspace download per unique bundle.
@@ -31,11 +32,11 @@ Read-only discovery step. Use this when you've been pointed at a new workspace a
 - Lists existing notification destinations via the Databricks SDK and checks for a `display_name` collision.
 - If a destination with that name already exists, prints its ID/URL and exits 0 (no mutation — idempotent on re-run).
 - Otherwise creates a new generic-webhook destination via `notification_destinations.create()`.
-- Prints a human-readable summary including the destination ID — that ID is what `bulk_apply_webhooks.py` and `patch_bundle_yaml.py` consume downstream.
+- Prints a human-readable summary including the destination ID — that ID is what `apply_webhooks_to_direct_jobs.py` and `patch_bundle_yaml.py` consume downstream.
 
 ---
 
-## What `bulk_apply_webhooks.py` does
+## What `apply_webhooks_to_direct_jobs.py` does
 
 Bulk-attach path (the rollback / detach path lives in
 [`remove_webhooks.py`](#what-remove_webhookspy-does)).
@@ -43,18 +44,17 @@ Bulk-attach path (the rollback / detach path lives in
 - Enumerates jobs via `GET /api/2.2/jobs/list` (paginated).
 - For each job, computes the desired `webhook_notifications` block by merging the supplied webhook ID into the configured event lists (defaults: `on_failure`, `on_duration_warning_threshold_exceeded` — chosen to stay low-noise across many workspaces; pass `--events on_failure,on_success,on_start` if you also want lifecycle events). Existing webhooks are preserved.
 - Calls `POST /api/2.2/jobs/update` to apply the change.
-- Skips bundle-managed jobs by default (because `databricks bundle deploy` would overwrite API edits), and emits an inventory CSV of those jobs for hand-off to bundle owners.
+- **Always skips** DAB-managed jobs (`settings.deployment.kind == BUNDLE`). There is no flag to override — API edits to bundle jobs are non-durable across `databricks bundle deploy`. Use `patch_bundle_yaml.py` for the bundle path. To find DAB jobs in a workspace, use `inventory_jobs.py` and filter `WHERE deployment_kind = 'BUNDLE'`.
 - Honors rate limits with exponential backoff plus jitter, and paces calls between updates.
 
 ## What `remove_webhooks.py` does
 
-Companion to `bulk_apply_webhooks.py` — owns the detach path. Same backoff /
-pacing / bundle-policy semantics; the mode is picked from which flags you
-pass:
+Companion to `apply_webhooks_to_direct_jobs.py` — owns the detach path. Same
+backoff / pacing semantics; the mode is picked from which flags you pass:
 
 - **Per-job by ID** — `--job-id` (repeatable) and/or `--job-ids-from <path>` (text/CSV). Looks up each job directly, no list pagination. `--webhook-id` optional: omit to clear ALL webhook_notifications from the targeted jobs.
-- **Workspace-walk by webhook ID** — omit `--job-id`; `--webhook-id` REQUIRED. Walks `jobs/list` with the same `--tag` / `--owner` / `--bundle-jobs` filters as add mode, pre-checks each job for the webhook, and removes it only from jobs that have it.
-- Bundle-managed jobs: per-job mode WARNs and proceeds; workspace-walk mode follows `--bundle-jobs` (default `skip`, consistent with add mode — API removal is non-durable across `bundle deploy`).
+- **Workspace-walk by webhook ID** — omit `--job-id`; `--webhook-id` REQUIRED. Walks `jobs/list` with `--tag` / `--owner` / `--bundle-jobs` filters, pre-checks each job for the webhook, and removes it only from jobs that have it.
+- Bundle-managed jobs: per-job mode WARNs and proceeds; workspace-walk mode follows `--bundle-jobs` (default `skip` — API removal is non-durable across `bundle deploy`).
 
 ---
 
@@ -63,11 +63,11 @@ pass:
 | Tool | Required version | Why |
 |------|------------------|-----|
 | Python | 3.9+ | Runtime for the script. |
-| `databricks-sdk` | >= 0.30.0 | API client used by `inventory_jobs.py`, `bulk_apply_webhooks.py`, and `create_webhook_destination.py`. Installed via `requirements.txt`. |
+| `databricks-sdk` | >= 0.30.0 | API client used by `inventory_jobs.py`, `apply_webhooks_to_direct_jobs.py`, `remove_webhooks.py`, and `create_webhook_destination.py`. Installed via `requirements.txt`. |
 | `ruamel.yaml` | >= 0.17.0 | Round-trip YAML reader/writer used by `patch_bundle_yaml.py`. Installed via `requirements.txt`. |
 | Databricks CLI | v0.230+ | Needed to fetch the notification destination ID, and for `databricks bundle deploy` after patching YAML. |
-| Workspace permissions | Read on `jobs/list` for `inventory_jobs.py`; "Can Manage" on every job in scope (or workspace-admin) for `bulk_apply_webhooks.py` | `jobs/update` enforces "Can Manage" per-job. The inventory script only lists, so a regular user is enough. |
-| Read access to bundle deployment metadata | For each bundle being inventoried (with `--enrich-bundles`, or any `bulk_apply_webhooks.py` run that encounters bundle jobs) | The script reads `/Workspace/Users/<owner>/.bundle/.../state/metadata.json` to enrich the CSV. Missing permission is non-fatal; affected rows just have empty bundle fields. |
+| Workspace permissions | Read on `jobs/list` for `inventory_jobs.py`; "Can Manage" on every job in scope (or workspace-admin) for `apply_webhooks_to_direct_jobs.py` / `remove_webhooks.py` | `jobs/update` enforces "Can Manage" per-job. The inventory script only lists, so a regular user is enough. |
+| Read access to bundle deployment metadata | For each bundle being inventoried with `inventory_jobs.py --enrich-bundles`, or any `remove_webhooks.py` run that encounters bundle jobs | The script reads `/Workspace/Users/<owner>/.bundle/.../state/metadata.json` to enrich the CSV. Missing permission is non-fatal; affected rows just have empty bundle fields. |
 
 ---
 
@@ -79,7 +79,7 @@ cd bulk_apply_webhooks_dbx_jobs
 pip install -r requirements.txt
 ```
 
-Pick the scripts you actually need: `inventory_jobs.py` for read-only discovery, `bulk_apply_webhooks.py` for attaching webhooks against directly-deployed jobs, `remove_webhooks.py` for detaching them (rollback / cleanup), `patch_bundle_yaml.py` for the bundle-YAML PR path, and `create_webhook_destination.py` if you want to create the destination from the same CLI flow. `requirements.txt` covers all five.
+Pick the scripts you actually need: `inventory_jobs.py` for read-only discovery, `apply_webhooks_to_direct_jobs.py` for attaching webhooks against directly-deployed jobs, `remove_webhooks.py` for detaching them (rollback / cleanup), `patch_bundle_yaml.py` for the bundle-YAML PR path, and `create_webhook_destination.py` if you want to create the destination from the same CLI flow. `requirements.txt` covers all five.
 
 ---
 
@@ -142,11 +142,11 @@ The notebook layer writes inventory output to a Delta table partitioned by
 the latest scan across all workspaces.
 
 - `inventory_jobs` notebook → `delta_table` widget (default `main.webhook_rollout.jobs_inventory`)
-- `bulk_apply_webhooks` notebook → `delta_table` widget (bundle-managed jobs encountered; default `main.webhook_rollout.bundle_jobs`)
-- `create_webhook_destination` and `patch_bundle_yaml` notebooks: no Delta output (no inventory to write)
+- `remove_webhooks` notebook → `delta_table` widget (bundle-managed jobs encountered during walk-mode rollback; default `main.webhook_rollout.bundle_jobs`)
+- `apply_webhooks_to_direct_jobs`, `create_webhook_destination`, and `patch_bundle_yaml` notebooks: no Delta output (no inventory to write — the attach script always skips DAB jobs and produces no bundle inventory)
 
-CSV output stays available in the CLI (`--output`, `--bundle-report`); the
-notebook layer disables it by default.
+CSV output stays available in the CLI (`--output`, `--bundle-report` for the
+remove script); the notebook layer disables it by default.
 
 ### Scan performance
 The Databricks Jobs API does not support server-side filtering on tag or creator,
@@ -178,11 +178,14 @@ so tag-filtered walks must iterate the full job list. Two widgets help here:
    row per job across all listed workspaces.
 7. Then `notebooks/create_webhook_destination` to provision the destination in
    each workspace (apply=true once the dry-run looks right).
-8. Then `notebooks/bulk_apply_webhooks` to attach the destination to
-   directly-deployed jobs. Bundle-managed jobs are skipped by default and
-   listed in the `bundle_jobs` Delta table for owner follow-up.
-9. For bundle-managed jobs, owner clones the DAB repo as a Databricks Git
-   folder, opens `notebooks/patch_bundle_yaml`, runs dry-run, then apply.
+8. Then `notebooks/apply_webhooks_to_direct_jobs` to attach the destination
+   to directly-deployed jobs. Bundle-managed jobs are always skipped. The
+   bundle-managed jobs that need patching are visible in the
+   `jobs_inventory` Delta table from step 6 (filter
+   `WHERE deployment_kind = 'BUNDLE'`).
+9. For each owning bundle, the bundle owner clones the DAB repo as a
+   Databricks Git folder, opens `notebooks/patch_bundle_yaml`, runs dry-run,
+   then apply.
    Commits + pushes from the Repos UI; CI runs `databricks bundle validate`
    and merge triggers `databricks bundle deploy`. The notebook **does not**
    validate or deploy — that gate stays in PR/CI.
@@ -233,7 +236,7 @@ Top 10 bundles (by job count):
 The CSV (`jobs_inventory.csv` by default) has one row per job with `deployment_kind` (`BUNDLE` or `DIRECT`) in column 4, followed by the same bundle-metadata columns as `bundle_jobs.csv`. Useful filters:
 
 ```bash
-# Just the DAB-deployed jobs — same set bulk_apply_webhooks.py would skip
+# Just the DAB-deployed jobs — same set apply_webhooks_to_direct_jobs.py would skip
 awk -F, '$4=="BUNDLE"' jobs_inventory.csv
 
 # Group bundle jobs by owning bundle + target
@@ -363,22 +366,21 @@ The bulk script is **dry-run by default**. It only mutates when `--apply` is pas
 
 ```bash
 # 0. Size up the workspace before doing anything else. No mutation, no webhook ID needed.
-#    Tells you how many jobs are DAB-deployed (need step 4) vs directly-deployed
-#    (need step 3). Writes jobs_inventory.csv.
+#    Tells you how many jobs are DAB-deployed (need step 3) vs directly-deployed
+#    (need step 2). Writes jobs_inventory.csv with deployment_kind + bundle metadata.
 python3 inventory_jobs.py --enrich-bundles
 
-# 1. Dry-run the full workspace against the bulk script. No changes.
-python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID"
+# 1. Dry-run the bulk attach against directly-deployed jobs. No changes.
+#    Bundle-managed jobs are silently skipped — see stats.bundle_skipped at the end.
+python3 apply_webhooks_to_direct_jobs.py --webhook-id "$WEBHOOK_ID"
 
-# 2. Inventory bundle-managed jobs separately via the bulk script's --bundle-jobs only
-#    pass. Produces bundle_jobs.csv (subset of jobs_inventory.csv's BUNDLE rows).
-python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID" --bundle-jobs only
+# 2. Apply to directly-deployed jobs.
+python3 apply_webhooks_to_direct_jobs.py --webhook-id "$WEBHOOK_ID" --apply
 
-# 3. Apply to all non-bundle jobs.
-python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID" --apply
-
-# 4. For the bundle-managed jobs the bulk script skipped, patch each owning bundle's
-#    YAML and open a PR — see "Companion script: patch_bundle_yaml.py" below.
+# 3. For the bundle-managed jobs (the BUNDLE rows in jobs_inventory.csv), patch each
+#    owning bundle's YAML and open a PR — see "Companion script: patch_bundle_yaml.py"
+#    below. Find the bundles via:
+#    awk -F, 'NR>1 && $4=="BUNDLE" {print $5, $1, $2}' jobs_inventory.csv
 ```
 
 For workspaces with many jobs, do a staged rollout first — see the next section.
@@ -407,7 +409,7 @@ python3 remove_webhooks.py --job-id 1234 --webhook-id "$WEBHOOK_ID" --apply
 python3 remove_webhooks.py --job-id 1234 --webhook-id "$WEBHOOK_ID"
 ```
 
-`--job-ids-from <path>` reads job IDs from a text file or CSV — one ID per line, or the first column of a CSV. A header row is auto-detected (so `jobs_inventory.csv` and `bundle_jobs.csv` pipe in directly), and explicit `--job-id` flags merge with the file (de-duplicated).
+`--job-ids-from <path>` reads job IDs from a text file or CSV — one ID per line, or the first column of a CSV. A header row is auto-detected (so `jobs_inventory.csv` pipes in directly), and explicit `--job-id` flags merge with the file (de-duplicated).
 
 ```bash
 # Roll back every directly-deployed job listed in jobs_inventory.csv
@@ -416,9 +418,12 @@ python3 remove_webhooks.py \
     --job-ids-from <(awk -F, 'NR>1 && $4=="DIRECT" {print $1}' jobs_inventory.csv) \
     --apply
 
-# Or feed bundle_jobs.csv directly (header auto-skipped)
-python3 remove_webhooks.py --webhook-id "$WEBHOOK_ID" \
-    --job-ids-from bundle_jobs.csv
+# Or roll back every BUNDLE-deployed job (useful for cleaning up stale refs
+# before re-patching the YAML)
+python3 remove_webhooks.py \
+    --webhook-id "$WEBHOOK_ID" \
+    --job-ids-from <(awk -F, 'NR>1 && $4=="BUNDLE" {print $1}' jobs_inventory.csv) \
+    --apply
 
 # Combine with --job-id (results merged, de-duplicated)
 python3 remove_webhooks.py --webhook-id "$WEBHOOK_ID" \
@@ -427,7 +432,7 @@ python3 remove_webhooks.py --webhook-id "$WEBHOOK_ID" \
 
 ### Shape 2 — workspace-walk rollback (`--webhook-id <id>` with no `--job-id`)
 
-Mirrors add mode's main loop: paginate `jobs/list`, apply `--tag` / `--owner` / `--bundle-jobs` filters, and remove the named destination from every matching job that currently has it. Jobs without the destination are short-circuited with a DEBUG line — no `jobs.update` calls — so it's safe to run broadly.
+Paginate `jobs/list`, apply `--tag` / `--owner` / `--bundle-jobs` filters, and remove the named destination from every matching job that currently has it. Jobs without the destination are short-circuited with a DEBUG line — no `jobs.update` calls — so it's safe to run broadly.
 
 ```bash
 # Workspace-wide: detach this destination from every job that has it. Dry-run.
@@ -451,13 +456,17 @@ python3 remove_webhooks.py --webhook-id "$WEBHOOK_ID" --limit 10 --apply
 - No `--events` flag — when a destination is removed, it's removed from every event it was subscribed to.
 - Re-running with the same arguments is a no-op (logs `not currently attached`).
 - Dry-run by default; pass `--apply` to write.
-- Pacing + backoff identical to `bulk_apply_webhooks.py` (`--base-sleep`, `--jitter`, `--max-retries`).
+- Pacing + backoff identical to `apply_webhooks_to_direct_jobs.py` (`--base-sleep`, `--jitter`, `--max-retries`).
 
 **Bundle-managed jobs**
 
+Unlike the attach script (which always skips bundle jobs), `remove_webhooks.py`
+can detach from them — useful for cleaning up stale references on bundle jobs
+before re-patching the YAML. The defaults still favor caution:
+
 - Per-job-id / `--job-ids-from` rollback: bundle jobs proceed with a `WARNING` (the user pointed at the job explicitly, so we honor it). The API change is non-durable — the next `databricks bundle deploy` re-adds whatever the bundle YAML specifies.
-- Workspace-walk rollback: bundle jobs follow `--bundle-jobs` (default **`skip`**), consistent with `bulk_apply_webhooks.py` and the non-durability concern above. They're still recorded into `bundle_jobs.csv` so you can patch the owning bundles separately. `--bundle-jobs=include` is the explicit opt-in for "take it off everywhere now, we'll patch bundles later."
-- Durable bundle rollback in either case is to revert (or modify) the `patch_bundle_yaml.py`-generated PR — the bulk/remove scripts only affect live job settings.
+- Workspace-walk rollback: bundle jobs follow `--bundle-jobs` (default **`skip`**) — consistent with the attach script's always-skip stance, and the non-durability concern above. They're still recorded into `bundle_jobs.csv` so you can patch the owning bundles separately. `--bundle-jobs=include` is the explicit opt-in for "take it off everywhere now, we'll patch bundles later."
+- Durable bundle rollback in either case is to revert (or modify) the `patch_bundle_yaml.py`-generated PR — the remove script only affects live job settings.
 
 ---
 
@@ -467,17 +476,17 @@ python3 remove_webhooks.py --webhook-id "$WEBHOOK_ID" --limit 10 --apply
 
 ```bash
 # A specific team's jobs
-python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID" --tag team=platform --apply
+python3 apply_webhooks_to_direct_jobs.py --webhook-id "$WEBHOOK_ID" --tag team=platform --apply
 
 # Tag presence only (any value)
-python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID" --tag rollout-cohort-1 --apply
+python3 apply_webhooks_to_direct_jobs.py --webhook-id "$WEBHOOK_ID" --tag rollout-cohort-1 --apply
 
 # Specific owners (repeatable)
-python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID" \
+python3 apply_webhooks_to_direct_jobs.py --webhook-id "$WEBHOOK_ID" \
     --owner alice@example.com --owner bob@example.com --apply
 
 # Belt-and-suspenders: hard cap on number of updates
-python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID" \
+python3 apply_webhooks_to_direct_jobs.py --webhook-id "$WEBHOOK_ID" \
     --tag webhook-rollout-pilot --limit 5 --apply
 ```
 
@@ -493,19 +502,15 @@ Recommended ramp:
 
 This is the most important caveat.
 
-Jobs deployed via `databricks bundle deploy` carry `settings.deployment.kind == BUNDLE`. The bundle's YAML in the source repo is the source of truth — any direct API edit (including the one this script would make) will be **silently overwritten on the next `bundle deploy`**. Worse: bundle deployments in `mode: production` set `edit_mode: UI_LOCKED`, but API edits still succeed, making the regression invisible until the next deploy.
+Jobs deployed via `databricks bundle deploy` carry `settings.deployment.kind == BUNDLE`. The bundle's YAML in the source repo is the source of truth — any direct API edit (including the one `apply_webhooks_to_direct_jobs.py` would make) will be **silently overwritten on the next `bundle deploy`**. Worse: bundle deployments in `mode: production` set `edit_mode: UI_LOCKED`, but API edits still succeed, making the regression invisible until the next deploy.
 
-To handle this, the script ships three policies via `--bundle-jobs`:
+That's why `apply_webhooks_to_direct_jobs.py` **always skips** bundle jobs. There is no flag to override — the escape hatches (`--bundle-jobs include` / `only`) were removed because they produced non-durable edits more often than they helped. Bundle jobs are exclusively the patcher's responsibility.
 
-| Policy | Behavior |
-|--------|----------|
-| `skip` (default) | Bundle jobs are detected and recorded in `bundle_jobs.csv` but never mutated. Other jobs are processed normally. |
-| `only` | Process only bundle jobs (useful for auditing — pair with dry-run). |
-| `include` | Write through anyway. **Use only when you have already added the webhook to the bundle YAML and want a one-time fast-path before the next deploy.** Otherwise the change is non-durable. |
+`remove_webhooks.py` still has the `--bundle-jobs` flag because cleaning up stale webhook references on bundle jobs before re-patching the YAML is a legitimate use case (it's a one-shot cleanup, not a config the next `bundle deploy` would clobber meaningfully).
 
 ### The right way to add a webhook to a bundle-managed job
 
-Use the inventory CSV (see next section) to find the owning bundles, then patch the YAML in each bundle's source repo. Use `patch_bundle_yaml.py` to do this automatically — see the next section.
+Use `inventory_jobs.py --enrich-bundles` to produce a CSV with `deployment_kind` + bundle metadata (`bundle_name`, `target`, `git_origin`, ...). Filter for `BUNDLE` rows to find the owning bundles, then patch the YAML in each bundle's source repo with `patch_bundle_yaml.py` — see the next section.
 
 The patched YAML will look like:
 
@@ -895,9 +900,9 @@ Lists every variable reference in the bundle. If any sit inside a `webhook_notif
 
 ---
 
-## Output: `bundle_jobs.csv`
+## Output: `bundle_jobs.csv` (from `remove_webhooks.py` only)
 
-Written at the end of any run that encountered bundle jobs (unless `--bundle-report ''` is passed). Columns:
+Written by `remove_webhooks.py` at the end of any walk-mode run that encountered bundle jobs (unless `--bundle-report ''` is passed). `apply_webhooks_to_direct_jobs.py` does NOT produce this CSV — it never fetches bundle metadata since bundle jobs are skipped. For the same information from a read-only scan, use `inventory_jobs.py --enrich-bundles`. Columns:
 
 | Column | Source |
 |--------|--------|
@@ -919,7 +924,7 @@ If the script couldn't read a bundle's metadata (e.g. ACL on the workspace path)
 
 ## CLI reference
 
-### `bulk_apply_webhooks.py`
+### `apply_webhooks_to_direct_jobs.py`
 
 ```
 --webhook-id <id>          Notification destination ID to attach. REQUIRED.
@@ -935,14 +940,12 @@ If the script couldn't read a bundle's metadata (e.g. ACL on the workspace path)
                            (or just key for presence-only).
 --owner <email>            Filter by creator_user_name. Repeatable.
 
---bundle-jobs {skip,include,only}
-                           Policy for jobs with deployment.kind=BUNDLE.
-                           Default: skip.
---bundle-report <path>     CSV output path for bundle jobs encountered.
-                           Default: bundle_jobs.csv. Pass '' to disable.
+# DAB-managed jobs (settings.deployment.kind == BUNDLE) are always skipped.
+# There is no --bundle-jobs flag; use patch_bundle_yaml.py for those.
 
 --apply                    Actually call jobs/update. Default is dry-run.
 --limit <N>                Stop after N updates (matched + would_update).
+                           Bundle-skipped jobs do NOT consume this cap.
 --progress-every <N>       Log a tally every N scanned jobs. Default 500.
                            Set 0 to disable.
 
@@ -1091,14 +1094,13 @@ databricks bundle validate
 databricks bundle deploy
 cd ../..
 
-# 2. Confirm the bulk script detects the deployed job as bundle-managed.
-#    Look for bundle_total=1 in the summary and inspect bundle_jobs.csv.
-python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID" \
-    --tag webhook-test=simple --bundle-jobs only
+# 2. Confirm inventory_jobs classifies the deployed job as BUNDLE.
+#    Look for BUNDLE in jobs_inventory.csv's deployment_kind column.
+python3 inventory_jobs.py --tag webhook-test=simple --enrich-bundles
 
-# 3. Confirm the default skip behavior leaves bundle jobs untouched even
+# 3. Confirm apply_webhooks_to_direct_jobs always skips bundle jobs even
 #    with --apply. Look for `SKIP bundle-managed` and updated=0.
-python3 bulk_apply_webhooks.py --webhook-id "$WEBHOOK_ID" \
+python3 apply_webhooks_to_direct_jobs.py --webhook-id "$WEBHOOK_ID" \
     --tag webhook-test=simple --apply
 
 # 4. Patch the YAML via the companion script (dry-run first).
