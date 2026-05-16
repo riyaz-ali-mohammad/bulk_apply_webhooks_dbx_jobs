@@ -1,33 +1,32 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Bulk-attach a Webhook Notification Destination on Jobs
+# MAGIC # Remove (detach) a Webhook Notification Destination from Jobs
 # MAGIC
-# MAGIC Walks the Jobs API across one or more target workspaces and attaches a
-# MAGIC webhook destination on every matching job. Default is **dry-run** —
-# MAGIC flip `apply=true` to actually mutate.
-# MAGIC
-# MAGIC For the rollback / detach path, see the companion notebook
-# MAGIC `notebooks/remove_webhooks`.
+# MAGIC Companion to `bulk_apply_webhooks` — the rollback / detach path. Default
+# MAGIC is **dry-run** — flip `apply=true` to actually mutate.
 # MAGIC
 # MAGIC ## Multi-workspace + SP auth
-# MAGIC Same model as the inventory notebook: a single Entra-ID SP registered as a
+# MAGIC Same model as the other notebooks: a single Entra-ID SP registered as a
 # MAGIC Databricks-account service principal, granted workspace-admin on each
 # MAGIC target. The notebook loops over `WORKSPACE_URLS`, one `WorkspaceClient`
 # MAGIC per workspace. Per-workspace failures log a WARNING and the loop continues.
 # MAGIC
-# MAGIC ## Scan performance
-# MAGIC The Jobs API does **not** support server-side filtering on tag or creator.
-# MAGIC - `limit` caps **mutations** (jobs that would actually be updated). When
-# MAGIC   matches are sparse, the loop still walks the full workspace looking for
-# MAGIC   more matches.
-# MAGIC - `scan_limit` caps the **walk itself** (jobs scanned, regardless of
-# MAGIC   matches). Use this for "touch only the first N jobs the workspace
-# MAGIC   returns" rollouts.
+# MAGIC ## Modes (selected automatically based on widget values)
+# MAGIC - **Per-job rollback**: set `job_id` and/or `job_ids_from`. `webhook_id`
+# MAGIC   optional — omit to clear ALL webhook_notifications from the listed jobs.
+# MAGIC   Filters (`tag`/`owner`) and `bundle_jobs`/`scan_limit`/`limit` are
+# MAGIC   ignored in this mode.
+# MAGIC - **Workspace-walk rollback**: leave `job_id` and `job_ids_from` empty.
+# MAGIC   `webhook_id` REQUIRED. Walks each workspace honoring
+# MAGIC   `tag`/`owner`/`bundle_jobs`/`scan_limit`/`limit` and removes only that
+# MAGIC   destination from every matching job that currently has it.
 # MAGIC
 # MAGIC ## Bundle-managed jobs
-# MAGIC `bundle_jobs=skip` (default) leaves DAB-managed jobs untouched; `bundle
-# MAGIC deploy` would otherwise silently overwrite the API edit. Use the patcher
-# MAGIC notebook for bundle-managed jobs.
+# MAGIC - **Per-job mode**: the script proceeds and emits a WARNING. API edits
+# MAGIC   to bundle jobs are non-durable — `databricks bundle deploy` will
+# MAGIC   re-add the webhook unless the bundle YAML is also patched via the
+# MAGIC   patcher notebook.
+# MAGIC - **Walk mode**: follows the `bundle_jobs` widget (default `skip`).
 
 # COMMAND ----------
 
@@ -48,18 +47,19 @@
 dbutils.widgets.text("secret_scope", "webhook-rollout", "Databricks secret scope")
 
 # Operation
-dbutils.widgets.text("webhook_id", "", "webhook destination ID (required)")
-dbutils.widgets.text("events", "on_failure,on_duration_warning_threshold_exceeded",
-    "comma-separated event list")
+dbutils.widgets.text("webhook_id", "",
+    "webhook destination ID (REQUIRED in walk mode; optional in per-job mode)")
+dbutils.widgets.text("job_id", "", "explicit job IDs (comma-separated; per-job mode)")
+dbutils.widgets.text("job_ids_from", "", "path to text/CSV of job IDs (per-job mode)")
 dbutils.widgets.dropdown("apply", "false", ["false", "true"], "actually mutate (vs dry-run)")
 
-# Filters
-dbutils.widgets.text("tag", "", "tag filter (key=value or key)")
-dbutils.widgets.text("owner", "", "owner filter (comma-separated emails)")
+# Filters (walk mode only)
+dbutils.widgets.text("tag", "", "tag filter (key=value or key) — walk mode only")
+dbutils.widgets.text("owner", "", "owner filter (comma-separated emails) — walk mode only")
 dbutils.widgets.dropdown("bundle_jobs", "skip", ["skip", "include", "only"],
-    "policy for DAB-managed jobs")
+    "policy for DAB-managed jobs (walk mode only)")
 
-# Performance
+# Performance (walk mode only)
 dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap)")
 dbutils.widgets.text("limit", "", "cap on jobs to update (empty = no cap)")
 
@@ -85,9 +85,10 @@ for u in WORKSPACE_URLS:
 
 # MAGIC %md
 # MAGIC ## Output destination
-# MAGIC Edit the fully-qualified UC table below before running. This collects the
-# MAGIC bundle-managed jobs encountered during the walk (the rows bundle owners
-# MAGIC need to find which YAML to patch). Set to an empty string to disable.
+# MAGIC Edit the fully-qualified UC table below before running. This collects
+# MAGIC bundle-managed jobs encountered during a workspace walk (the rows
+# MAGIC bundle owners need to find which YAML to patch). Set to an empty string
+# MAGIC to disable. Unused in per-job mode.
 # MAGIC The SP must have `USE CATALOG`, `USE SCHEMA`, and `CREATE TABLE` on the
 # MAGIC target schema.
 
@@ -106,7 +107,8 @@ DELTA_TABLE = "main.webhook_rollout.bundle_jobs"
 
 secret_scope = dbutils.widgets.get("secret_scope").strip()
 webhook_id = dbutils.widgets.get("webhook_id").strip()
-events = dbutils.widgets.get("events").strip()
+job_id = dbutils.widgets.get("job_id").strip()
+job_ids_from = dbutils.widgets.get("job_ids_from").strip()
 apply_flag = dbutils.widgets.get("apply")
 tag = dbutils.widgets.get("tag").strip()
 owner_raw = dbutils.widgets.get("owner").strip()
@@ -118,7 +120,8 @@ limit = dbutils.widgets.get("limit").strip()
 
 print(f"secret_scope:  {secret_scope!r}")
 print(f"webhook_id:    {webhook_id!r}")
-print(f"events:        {events!r}")
+print(f"job_id:        {job_id!r}")
+print(f"job_ids_from:  {job_ids_from!r}")
 print(f"apply:         {apply_flag!r}")
 print(f"tag:           {tag!r}")
 print(f"owner:         {owner_raw!r}")
@@ -181,8 +184,12 @@ for p in (repo_root, notebooks_dir):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-import bulk_apply_webhooks
+import remove_webhooks
 import _auth
+
+
+def _parse_csv_ints(s: str):
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
 def _parse_csv_strs(s: str):
@@ -196,7 +203,8 @@ def _optional_int(s: str):
 
 shared_kwargs = dict(
     webhook_id=webhook_id or None,
-    events=events,
+    job_id=_parse_csv_ints(job_id),
+    job_ids_from=job_ids_from or None,
     tag=tag or None,
     owner=_parse_csv_strs(owner_raw),
     bundle_jobs=bundle_jobs,
@@ -223,13 +231,14 @@ clients = _auth.build_clients(
 )
 
 apply_label = "APPLY" if shared_kwargs["apply"] else "DRY-RUN"
-print(f"ADD ({apply_label}) across {len(clients)} workspace(s)")
+mode_label = "PER-JOB" if (shared_kwargs["job_id"] or shared_kwargs["job_ids_from"]) else "WALK"
+print(f"REMOVE ({mode_label}, {apply_label}) across {len(clients)} workspace(s)")
 
 errors = []
 for w in clients:
     print(f"\n=== {w.config.host} ===")
     try:
-        rc = bulk_apply_webhooks.run(client=w, workspace_label=w.config.host, **shared_kwargs)
+        rc = remove_webhooks.run(client=w, workspace_label=w.config.host, **shared_kwargs)
         if rc != 0:
             errors.append((w.config.host, f"run returned {rc}"))
     except Exception as e:
@@ -246,6 +255,6 @@ print("\nDone.")
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- Inspect the bundle-jobs report written above. Edit the table name if
-# MAGIC -- you changed the DELTA_TABLE constant.
+# MAGIC -- Inspect the bundle-jobs report written above (walk mode only).
+# MAGIC -- Edit the table name if you changed the DELTA_TABLE constant.
 # MAGIC SELECT * FROM main.webhook_rollout.bundle_jobs

@@ -1,15 +1,16 @@
-"""Unit tests for bulk_apply_webhooks.py.
+"""Unit tests for bulk_apply_webhooks.py (add path only).
+
+The rollback / detach path lives in remove_webhooks.py with its own test file
+at tests/test_remove_webhooks.py.
 
 Two top-level groupings:
-  * Non-DAB jobs — the happy-path bulk attach/detach logic.
-  * DAB-deployed jobs — detection, bundle-metadata fetch, CSV inventory, and
-    the bundle-aware paths in remove mode.
+  * Non-DAB jobs — the happy-path bulk attach logic.
+  * DAB-deployed jobs — detection, bundle-metadata fetch, CSV inventory.
 """
 
 import csv
 import io
 import json
-import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -121,7 +122,7 @@ class TestJobMatches:
 
 
 # --------------------------------------------------------------------------- #
-# Non-DAB jobs: attach / detach / process_job
+# Non-DAB jobs: attach / process_job
 # --------------------------------------------------------------------------- #
 
 
@@ -162,36 +163,6 @@ class TestMergeWebhooks:
         result = bulk.merge_webhooks(existing, WEBHOOK_ID, ["on_failure"])
         assert [w.id for w in result.on_start] == ["start-only"]
         assert [w.id for w in result.on_failure] == [WEBHOOK_ID]
-
-
-class TestRemoveWebhooks:
-    def test_remove_specific_destination_leaves_others(self):
-        existing = WebhookNotifications(
-            on_failure=[Webhook(id=WEBHOOK_ID), Webhook(id=OTHER_ID)],
-        )
-        result, count = bulk.remove_webhooks(existing, WEBHOOK_ID)
-        assert count == 1
-        assert [w.id for w in result.on_failure] == [OTHER_ID]
-
-    def test_remove_all_clears_every_event_list(self):
-        existing = WebhookNotifications(
-            on_failure=[Webhook(id=WEBHOOK_ID)],
-            on_success=[Webhook(id=OTHER_ID)],
-        )
-        result, count = bulk.remove_webhooks(existing, None)
-        assert count == 2
-        assert result.on_failure == []
-        assert result.on_success == []
-
-    def test_no_op_when_target_not_attached(self):
-        existing = WebhookNotifications(on_failure=[Webhook(id=OTHER_ID)])
-        _, count = bulk.remove_webhooks(existing, WEBHOOK_ID)
-        assert count == 0
-
-    def test_no_existing_returns_empty(self):
-        result, count = bulk.remove_webhooks(None, WEBHOOK_ID)
-        assert count == 0
-        assert isinstance(result, WebhookNotifications)
 
 
 class TestProcessJobNonDAB:
@@ -236,7 +207,7 @@ class TestProcessJobNonDAB:
 
 
 # --------------------------------------------------------------------------- #
-# DAB-deployed jobs: detection, metadata, CSV inventory, remove-mode warning
+# DAB-deployed jobs: detection, metadata, CSV inventory
 # --------------------------------------------------------------------------- #
 
 
@@ -345,271 +316,17 @@ class TestWriteBundleReport:
         bulk.write_bundle_report("", [bulk.BundleJobRecord(1, "x", None, None)])
 
 
-class TestProcessRemoveJobDAB:
-    """--remove against a DAB job: must proceed but emit a WARNING (non-durable)."""
-
-    def test_warns_on_bundle_job_when_removing(self, caplog):
-        w = MagicMock()
-        bundle_job = _make_job(
-            bundle=True,
-            metadata_file_path="/meta",
-            webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)]),
-        )
-        w.jobs.get.return_value = bundle_job
-        stats = bulk.Stats()
-        with caplog.at_level(logging.WARNING):
-            bulk.process_remove_job(w, 100, WEBHOOK_ID, apply=False, max_retries=0, stats=stats)
-        assert any("bundle-managed" in r.message for r in caplog.records)
-        assert stats.would_update == 1
-
-    def test_no_warning_for_non_bundle_job(self, caplog):
-        w = MagicMock()
-        w.jobs.get.return_value = _make_job(
-            webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)]),
-        )
-        stats = bulk.Stats()
-        with caplog.at_level(logging.WARNING):
-            bulk.process_remove_job(w, 100, WEBHOOK_ID, apply=False, max_retries=0, stats=stats)
-        assert not any("bundle-managed" in r.message for r in caplog.records)
-
-
 # --------------------------------------------------------------------------- #
-# Workspace-walk rollback path (--remove without --job-id)
+# run(**kwargs) contract (the surface notebook widgets map to)
 # --------------------------------------------------------------------------- #
-
-
-class TestWebhookAttached:
-    def test_none_existing_false(self):
-        assert bulk.webhook_attached(None, WEBHOOK_ID) is False
-
-    def test_attached_on_one_event(self):
-        existing = WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)])
-        assert bulk.webhook_attached(existing, WEBHOOK_ID) is True
-
-    def test_attached_on_another_event(self):
-        existing = WebhookNotifications(on_success=[Webhook(id=WEBHOOK_ID)])
-        assert bulk.webhook_attached(existing, WEBHOOK_ID) is True
-
-    def test_only_other_webhooks_present(self):
-        existing = WebhookNotifications(on_failure=[Webhook(id=OTHER_ID)])
-        assert bulk.webhook_attached(existing, WEBHOOK_ID) is False
-
-
-class TestLoadJobIdsFromFile:
-    def test_plain_text_one_id_per_line(self, tmp_path):
-        path = tmp_path / "ids.txt"
-        path.write_text("1\n2\n3\n")
-        assert bulk.load_job_ids_from_file(str(path)) == [1, 2, 3]
-
-    def test_csv_with_inventory_header_row(self, tmp_path):
-        path = tmp_path / "inv.csv"
-        path.write_text(
-            "job_id,name,creator,deployment_kind\n"
-            "100,alpha,a@x.com,DIRECT\n"
-            "200,beta,b@x.com,BUNDLE\n"
-        )
-        assert bulk.load_job_ids_from_file(str(path)) == [100, 200]
-
-    def test_csv_without_header(self, tmp_path):
-        path = tmp_path / "no-header.csv"
-        path.write_text("42,alpha\n99,beta\n")
-        assert bulk.load_job_ids_from_file(str(path)) == [42, 99]
-
-    def test_blank_lines_and_whitespace_tolerated(self, tmp_path):
-        path = tmp_path / "messy.txt"
-        path.write_text("\n  1  \n\n2\n  \n3\n")
-        assert bulk.load_job_ids_from_file(str(path)) == [1, 2, 3]
-
-    def test_empty_file_raises(self, tmp_path):
-        path = tmp_path / "empty.txt"
-        path.write_text("")
-        with pytest.raises(SystemExit, match="No job IDs found"):
-            bulk.load_job_ids_from_file(str(path))
-
-    def test_non_numeric_mid_file_raises(self, tmp_path):
-        path = tmp_path / "bad.csv"
-        path.write_text("100\nnot-a-number\n")
-        with pytest.raises(SystemExit, match="Bad job ID"):
-            bulk.load_job_ids_from_file(str(path))
-
-
-def _walk_args(**overrides):
-    """Build a Namespace shaped like parse_args output for workspace-walk remove."""
-    defaults = dict(
-        remove=True,
-        webhook_id=WEBHOOK_ID,
-        job_id=[],
-        job_ids_from=None,
-        events="on_failure",
-        tag=None,
-        owner=[],
-        bundle_jobs="skip",
-        bundle_report="",
-        apply=False,
-        profile=None,
-        max_retries=0,
-        base_sleep=0,
-        jitter=0,
-        limit=None,
-        progress_every=0,
-        verbose=False,
-    )
-    defaults.update(overrides)
-    import argparse as _argparse
-    return _argparse.Namespace(**defaults)
-
-
-class TestRemoveWalkMode:
-    """Workspace-walk rollback: walk jobs, filter, pre-check `webhook_attached`,
-    and call jobs.update only on jobs that currently have the destination."""
-
-    def test_removes_only_matching_jobs(self):
-        # Three jobs: one attached, one with a different webhook, one bare.
-        jobs = [
-            _make_job(job_id=1, name="has-it",
-                      webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)])),
-            _make_job(job_id=2, name="has-other",
-                      webhooks=WebhookNotifications(on_failure=[Webhook(id=OTHER_ID)])),
-            _make_job(job_id=3, name="bare"),
-        ]
-        w = MagicMock()
-        w.jobs.list.return_value = iter(jobs)
-        stats = bulk.Stats()
-        rc = bulk.run_remove_walk_mode(_walk_args(apply=True), w, stats)
-        assert rc == 0
-        # Only job 1 should be updated.
-        assert w.jobs.update.call_count == 1
-        kwargs = w.jobs.update.call_args.kwargs
-        assert kwargs["job_id"] == 1
-        new_wh = kwargs["new_settings"].webhook_notifications
-        # WEBHOOK_ID stripped from on_failure (sent as []).
-        assert new_wh.on_failure == []
-        assert stats.updated == 1
-        assert stats.already_attached == 2  # the other two short-circuited
-
-    def test_dry_run_does_not_update(self):
-        jobs = [
-            _make_job(job_id=1, webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)])),
-        ]
-        w = MagicMock()
-        w.jobs.list.return_value = iter(jobs)
-        stats = bulk.Stats()
-        bulk.run_remove_walk_mode(_walk_args(apply=False), w, stats)
-        w.jobs.update.assert_not_called()
-        assert stats.would_update == 1
-
-    def test_owner_filter_applied(self):
-        jobs = [
-            _make_job(job_id=1, creator="alice@x.com",
-                      webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)])),
-            _make_job(job_id=2, creator="bob@x.com",
-                      webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)])),
-        ]
-        w = MagicMock()
-        w.jobs.list.return_value = iter(jobs)
-        stats = bulk.Stats()
-        bulk.run_remove_walk_mode(_walk_args(apply=True, owner=["alice@x.com"]), w, stats)
-        # Only alice's job touched.
-        assert w.jobs.update.call_count == 1
-        assert w.jobs.update.call_args.kwargs["job_id"] == 1
-
-    def test_bundle_skip_default(self, caplog):
-        jobs = [
-            _make_job(job_id=1, name="bundle-job",
-                      bundle=True, metadata_file_path="/m",
-                      webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)])),
-        ]
-        w = MagicMock()
-        w.jobs.list.return_value = iter(jobs)
-        stats = bulk.Stats()
-        with caplog.at_level(logging.INFO):
-            bulk.run_remove_walk_mode(_walk_args(apply=True), w, stats)
-        w.jobs.update.assert_not_called()
-        assert stats.bundle_skipped == 1
-        assert any("SKIP bundle-managed" in r.message for r in caplog.records)
-
-    def test_bundle_include_proceeds_with_warning(self, caplog):
-        jobs = [
-            _make_job(job_id=1, name="bundle-job",
-                      bundle=True, metadata_file_path="/m",
-                      webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)])),
-        ]
-        w = MagicMock()
-        w.jobs.list.return_value = iter(jobs)
-        stats = bulk.Stats()
-        with caplog.at_level(logging.WARNING):
-            bulk.run_remove_walk_mode(
-                _walk_args(apply=True, bundle_jobs="include"), w, stats,
-            )
-        assert w.jobs.update.call_count == 1
-        assert any("bundle-managed" in r.message for r in caplog.records)
-
-    def test_limit_short_circuits(self):
-        jobs = [
-            _make_job(job_id=i, webhooks=WebhookNotifications(on_failure=[Webhook(id=WEBHOOK_ID)]))
-            for i in range(1, 6)
-        ]
-        w = MagicMock()
-        w.jobs.list.return_value = iter(jobs)
-        stats = bulk.Stats()
-        bulk.run_remove_walk_mode(_walk_args(apply=True, limit=2), w, stats)
-        assert w.jobs.update.call_count == 2
-
-    def test_parse_args_requires_webhook_id_in_walk_mode(self, monkeypatch):
-        monkeypatch.setattr("sys.argv", ["bulk_apply_webhooks.py", "--remove"])
-        with pytest.raises(SystemExit):
-            bulk.parse_args()
-
-    def test_parse_args_rejects_filters_with_explicit_job_id(self, monkeypatch):
-        monkeypatch.setattr(
-            "sys.argv",
-            [
-                "bulk_apply_webhooks.py",
-                "--remove", "--webhook-id", WEBHOOK_ID,
-                "--job-id", "1",
-                "--tag", "team=x",
-            ],
-        )
-        with pytest.raises(SystemExit):
-            bulk.parse_args()
-
-
-class TestResolveRemoveJobIds:
-    """Merging --job-id and --job-ids-from preserves order and de-duplicates."""
-
-    def test_merges_explicit_and_file(self, tmp_path):
-        path = tmp_path / "ids.txt"
-        path.write_text("3\n4\n5\n")
-        args = _walk_args(job_id=[1, 2], job_ids_from=str(path))
-        assert bulk._resolve_remove_job_ids(args) == [1, 2, 3, 4, 5]
-
-    def test_dedupes_preserving_first_occurrence(self, tmp_path):
-        path = tmp_path / "ids.txt"
-        path.write_text("2\n3\n")
-        args = _walk_args(job_id=[1, 2], job_ids_from=str(path))
-        assert bulk._resolve_remove_job_ids(args) == [1, 2, 3]
 
 
 class TestRunCallable:
-    """Lock the run(**kwargs) contract that notebook widgets map to. The CLI's
-    post-parse cross-flag guards must also fire under run() — a notebook
-    caller should get the same SystemExit a CLI caller does."""
+    """Lock the run(**kwargs) contract that notebook widgets map to."""
 
-    def test_run_requires_webhook_id_in_add_mode(self):
-        with pytest.raises(SystemExit, match="--webhook-id is required"):
+    def test_run_requires_webhook_id(self):
+        with pytest.raises(SystemExit, match="webhook_id is required"):
             bulk.run(webhook_id=None)
-
-    def test_run_remove_walk_requires_webhook_id(self):
-        with pytest.raises(SystemExit, match="workspace-walk mode and REQUIRES"):
-            bulk.run(remove=True)
-
-    def test_run_remove_rejects_filters_with_explicit_jobs(self):
-        with pytest.raises(SystemExit, match="don't combine"):
-            bulk.run(remove=True, webhook_id=WEBHOOK_ID, job_id=[1], tag="team=x")
-
-    def test_run_add_rejects_job_id(self):
-        with pytest.raises(SystemExit, match="only valid with --remove"):
-            bulk.run(webhook_id=WEBHOOK_ID, job_id=[1])
 
     def test_run_kwargs_drive_add_path(self, monkeypatch):
         w = MagicMock()

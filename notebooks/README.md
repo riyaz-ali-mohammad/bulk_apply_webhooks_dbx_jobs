@@ -1,6 +1,6 @@
 # Databricks notebooks — webhook rollout runbook
 
-Hands-on guide for launching the four notebooks in this directory. The
+Hands-on guide for launching the five notebooks in this directory. The
 [top-level README](../README.md) covers the CLI variants and the design
 rationale; this one is the runbook for the support team.
 
@@ -9,7 +9,8 @@ notebooks/
 ├── _auth.py                       (helper — do not run directly)
 ├── inventory_jobs.py              read-only: list jobs, classify BUNDLE vs DIRECT, write Delta
 ├── create_webhook_destination.py  create the webhook destination (idempotent on display_name)
-├── bulk_apply_webhooks.py         attach / detach the destination on direct-deployed jobs
+├── bulk_apply_webhooks.py         attach the destination to direct-deployed jobs
+├── remove_webhooks.py             detach the destination from jobs (rollback / cleanup)
 └── patch_bundle_yaml.py           edit DAB YAML in place for bundle-managed jobs
 ```
 
@@ -72,23 +73,24 @@ Defaults assumed by every notebook:
 Each notebook runs a preflight cell that lists the scope and fails fast with a
 clear error if either key is missing.
 
-### 3. UC schema for Delta output (`inventory_jobs` + `bulk_apply_webhooks` only)
+### 3. UC schema for Delta output (`inventory_jobs`, `bulk_apply_webhooks`, `remove_webhooks`)
 
-The inventory and bulk-apply notebooks write to a Delta table. The SP needs
-`USE CATALOG`, `USE SCHEMA`, and `CREATE TABLE` on the target schema. Defaults:
+These three notebooks write to a Delta table. The SP needs `USE CATALOG`,
+`USE SCHEMA`, and `CREATE TABLE` on the target schema. Defaults:
 
 | Notebook              | Default table                              |
 |-----------------------|--------------------------------------------|
 | `inventory_jobs`      | `main.webhook_rollout.jobs_inventory`      |
 | `bulk_apply_webhooks` | `main.webhook_rollout.bundle_jobs`         |
+| `remove_webhooks`     | `main.webhook_rollout.bundle_jobs` (walk mode only — same schema, same partition column) |
 
-Both are set as `DELTA_TABLE = "..."` Python constants near the top of each
-notebook — edit them to your catalog/schema before the first run.
+All three are set as `DELTA_TABLE = "..."` Python constants near the top of
+each notebook — edit them to your catalog/schema before the first run.
 
 ### 4. Check out this repo as a Databricks Git folder
 
 In the management workspace: **Repos → Add Repo →** point at this repo's URL.
-The four notebooks must sit next to the `.py` scripts they import (the
+The five notebooks must sit next to the `.py` scripts they import (the
 notebooks do `sys.path.insert(0, repo_root)` to import `inventory_jobs.py`
 etc. as siblings).
 
@@ -114,8 +116,8 @@ learn it once:
    keys the dispatcher needs.
 8. **Main execution cell** — the multi-workspace loop. Per-workspace failures
    log a WARNING and the loop continues.
-9. **`%sql SELECT * FROM <table>`** (inventory + bulk only) — for quick output
-   inspection without leaving the notebook.
+9. **`%sql SELECT * FROM <table>`** (inventory + bulk + remove only) — for
+   quick output inspection without leaving the notebook.
 
 ## End-to-end workflow
 
@@ -133,11 +135,17 @@ bulk_apply_webhooks (apply=true)   ← attaches to DIRECT-deployed jobs
        │
        ▼
 patch_bundle_yaml                  ← for BUNDLE-deployed jobs, separate flow
+
+remove_webhooks                    ← off-cycle: rollback / cleanup
 ```
 
 `bulk_apply_webhooks` defaults to **skipping bundle-managed jobs** because
 `databricks bundle deploy` would silently overwrite an API edit. The patcher
 notebook is the durable path for those.
+
+`remove_webhooks` is the inverse of `bulk_apply_webhooks` — same multi-workspace
+shape, same bundle policy, opposite operation. Run it when a rollout needs to
+be reversed.
 
 ---
 
@@ -196,23 +204,21 @@ at the top of `../create_webhook_destination.py` for context.
 **Outputs**: the destination ID for each workspace, printed to cell output.
 Feed this into the `webhook_id` widget of `bulk_apply_webhooks`.
 
-## 3. `bulk_apply_webhooks` — attach (or detach)
+## 3. `bulk_apply_webhooks` — attach
 
 Walks the Jobs API across each workspace and attaches the destination to
-matching `DIRECT` jobs (or detaches it, with `remove=true`). Bundle-managed
-jobs are skipped by default; they're inventoried to the bundle-jobs Delta
-table so bundle owners can pick them up via `patch_bundle_yaml`.
+matching `DIRECT` jobs. Bundle-managed jobs are skipped by default; they're
+inventoried to the bundle-jobs Delta table so bundle owners can pick them up
+via `patch_bundle_yaml`. For the rollback / detach path, see `remove_webhooks`
+below.
 
-Widgets (the long list — most stay at default for a normal rollout):
+Widgets:
 
 | Widget          | Purpose                                                       |
 |-----------------|---------------------------------------------------------------|
 | `secret_scope`  | Secret scope holding the SP credentials                       |
-| `webhook_id`    | Destination ID from step 2 (required in add mode)             |
-| `remove`        | `true` to detach instead of attach                            |
-| `job_id`        | Comma-separated job IDs (remove-mode rollback path)           |
-| `job_ids_from`  | Path to a text/CSV of job IDs (remove-mode rollback path)     |
-| `events`        | Comma-separated event list (add mode). Defaults to `on_failure,on_duration_warning_threshold_exceeded` |
+| `webhook_id`    | Destination ID from step 2 (required)                         |
+| `events`        | Comma-separated event list. Defaults to `on_failure,on_duration_warning_threshold_exceeded` |
 | `apply`         | `false` = dry-run. `true` = actually mutate.                  |
 | `tag`           | Tag filter (`key=value` or `key`)                             |
 | `owner`         | Comma-separated creator emails                                |
@@ -220,23 +226,63 @@ Widgets (the long list — most stay at default for a normal rollout):
 | `scan_limit`    | Hard cap on jobs scanned (empty = no cap)                     |
 | `limit`         | Hard cap on jobs **mutated** (different from `scan_limit` — see "gotchas") |
 
-To run an add rollout:
+To run:
 1. Edit `WORKSPACE_URLS` and `DELTA_TABLE` cells.
 2. Set `webhook_id` from step 2.
 3. Run with `apply=false` first — produces the "would update N jobs" dry-run
    log and writes the bundle-jobs inventory.
 4. Re-run with `apply=true` to attach.
 
-To run a workspace-wide rollback (detach a destination from every job that
-has it):
-1. Set `remove=true`, `webhook_id=<id>`, leave `job_id` / `job_ids_from`
-   empty.
-2. Run with `apply=false` first, then `apply=true`.
+## 4. `remove_webhooks` — detach (rollback / cleanup)
 
-## 4. `patch_bundle_yaml` — bundle-managed jobs
+Inverse of `bulk_apply_webhooks`. Two shapes, picked automatically from which
+widgets you fill in:
+
+- **Per-job rollback**: set `job_id` and/or `job_ids_from`. `webhook_id`
+  optional — omit to clear **all** webhook_notifications from the listed jobs.
+  Filters and walk-mode widgets are ignored.
+- **Workspace-walk rollback**: leave `job_id` and `job_ids_from` empty.
+  `webhook_id` **REQUIRED**. Walks each workspace honoring `tag` / `owner` /
+  `bundle_jobs` / `scan_limit` / `limit` and removes only that destination
+  from every matching job that currently has it.
+
+Widgets:
+
+| Widget          | Purpose                                                       |
+|-----------------|---------------------------------------------------------------|
+| `secret_scope`  | Secret scope holding the SP credentials                       |
+| `webhook_id`    | Destination ID to detach. REQUIRED in walk mode; optional in per-job mode (omit to clear all). |
+| `job_id`        | Comma-separated job IDs (per-job mode)                        |
+| `job_ids_from`  | Path to a text/CSV of job IDs (per-job mode). UC Volume path recommended (`/Volumes/<cat>/<schema>/<vol>/file.csv`) — see "Gotchas" |
+| `apply`         | `false` = dry-run. `true` = actually mutate.                  |
+| `tag`           | Tag filter — walk mode only                                   |
+| `owner`         | Comma-separated creator emails — walk mode only               |
+| `bundle_jobs`   | `skip` (default) / `include` / `only` — walk mode only        |
+| `scan_limit`    | Hard cap on jobs scanned — walk mode only                     |
+| `limit`         | Hard cap on jobs mutated — walk mode only                     |
+
+To run a workspace-wide rollback (most common shape):
+1. Set `webhook_id` and leave `job_id` / `job_ids_from` empty.
+2. Run with `apply=false` first — the dry-run logs which jobs would be
+   detached without mutating anything.
+3. Re-run with `apply=true`.
+
+To roll back a specific list of jobs from `bundle_jobs.csv` /
+`jobs_inventory.csv`:
+1. Upload the CSV to a UC Volume (e.g. `/Volumes/main/webhook_rollout/csvs/jobs.csv`).
+2. Set `job_ids_from=/Volumes/.../jobs.csv` and (optionally) `webhook_id` to
+   limit the removal to that specific destination.
+3. Dry-run, then apply.
+
+Bundle-managed jobs in per-job mode proceed with a `WARNING` (API edits are
+non-durable — `databricks bundle deploy` will re-add the webhook unless the
+bundle YAML is also patched via `patch_bundle_yaml`). In walk mode they
+follow `bundle_jobs` (default `skip`).
+
+## 5. `patch_bundle_yaml` — bundle-managed jobs
 
 This is **single-workspace** (a DAB lives in one Git repo, deploys via CI).
-Different from the other three notebooks in two ways:
+Different from the other four notebooks in two ways:
 - No multi-workspace dispatcher.
 - It does a `%pip install ruamel.yaml` (the runtime doesn't ship it).
 - The notebook **stops at "patched files + git diff"** — it does NOT call
@@ -299,10 +345,11 @@ Use `scan_limit` if you wanted the walk to stop early.
 
 The Databricks runtime ships an older SDK (verified `0.20.0` on the
 workspace we tested against). Two consequences:
-- `inventory_jobs`, `bulk_apply_webhooks`, and `create_webhook_destination`
-  **do not** `%pip install databricks-sdk`. Installing it upgrades
-  `protobuf` past the runtime's pinned version and breaks PySpark (which
-  the Delta writes need). The notebooks rely on whatever the runtime ships.
+- `inventory_jobs`, `bulk_apply_webhooks`, `remove_webhooks`, and
+  `create_webhook_destination` **do not** `%pip install databricks-sdk`.
+  Installing it upgrades `protobuf` past the runtime's pinned version and
+  breaks PySpark (which the Delta writes need). The notebooks rely on
+  whatever the runtime ships.
 - `create_webhook_destination` calls the REST endpoint directly because the
   typed `notification_destinations` API isn't in 0.20.0. Already handled —
   no action needed.
