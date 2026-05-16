@@ -296,9 +296,13 @@ def run(
     `owner` is the repeatable `--owner` filter matched against `permissions:`."""
     if not webhook_id:
         raise SystemExit("webhook_id is required.")
+    # force=True overrides any pre-existing root logger handlers (e.g. the
+    # Databricks runtime installs its own, which makes a plain basicConfig()
+    # call a silent no-op and swallows our INFO output in notebook cells).
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
+        force=True,
     )
 
     bundle_dir_path = Path(bundle_dir).resolve()

@@ -97,10 +97,14 @@ def run(
     Kwargs mirror `parse_args()` 1:1 for the CLI shape; `client` is a notebook-
     only kwarg that lets the multi-workspace dispatcher inject a pre-built
     `WorkspaceClient` per target workspace (replacing the `profile` lookup)."""
+    # force=True overrides any pre-existing root logger handlers (e.g. the
+    # Databricks runtime installs its own, which makes a plain basicConfig()
+    # call a silent no-op and swallows our INFO output in notebook cells).
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         stream=sys.stderr,
+        force=True,
     )
     validate_url(url)
 
