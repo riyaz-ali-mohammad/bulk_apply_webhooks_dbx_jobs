@@ -20,8 +20,6 @@
 # MAGIC - `scan_limit` caps the **walk itself** (jobs scanned, regardless of
 # MAGIC   matches). Use this for "touch only the first N jobs the workspace
 # MAGIC   returns" rollouts.
-# MAGIC - `name_filter` is the **only filter the Jobs API supports server-side**.
-# MAGIC   Massive speedup when the support team knows part of the job name.
 # MAGIC
 # MAGIC ## Modes (set via `remove` widget)
 # MAGIC - `remove=false` (default): add mode. Requires `webhook_id`. Walks each
@@ -70,8 +68,6 @@ dbutils.widgets.dropdown("bundle_jobs", "skip", ["skip", "include", "only"],
     "policy for DAB-managed jobs")
 
 # Performance
-dbutils.widgets.text("name_filter", "",
-    "server-side substring filter on job name (forwarded to jobs.list)")
 dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap)")
 dbutils.widgets.text("limit", "", "cap on jobs to update (empty = no cap)")
 
@@ -126,7 +122,6 @@ apply_flag = dbutils.widgets.get("apply")
 tag = dbutils.widgets.get("tag").strip()
 owner_raw = dbutils.widgets.get("owner").strip()
 bundle_jobs = dbutils.widgets.get("bundle_jobs")
-name_filter = dbutils.widgets.get("name_filter").strip()
 scan_limit = dbutils.widgets.get("scan_limit").strip()
 limit = dbutils.widgets.get("limit").strip()
 
@@ -142,7 +137,6 @@ print(f"apply:         {apply_flag!r}")
 print(f"tag:           {tag!r}")
 print(f"owner:         {owner_raw!r}")
 print(f"bundle_jobs:   {bundle_jobs!r}")
-print(f"name_filter:   {name_filter!r}")
 print(f"scan_limit:    {scan_limit!r}")
 print(f"limit:         {limit!r}")
 
@@ -239,7 +233,6 @@ shared_kwargs = dict(
     spark=spark,
     delta_table=DELTA_TABLE or None,
     scan_limit=_optional_int(scan_limit),
-    name_filter=name_filter or None,
 )
 
 clients = _auth.build_clients(

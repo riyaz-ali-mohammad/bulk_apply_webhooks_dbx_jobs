@@ -64,8 +64,8 @@ dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap
 # COMMAND ----------
 
 WORKSPACE_URLS = [
-    'https://e2-demo-field-eng.cloud.databricks.com/',
-    'https://e2-demo-west.cloud.databricks.com/'
+    # 'https://e2-demo-field-eng.cloud.databricks.com/',
+    # 'https://e2-demo-west.cloud.databricks.com/'
 ]
 for u in WORKSPACE_URLS:
     print(u)
@@ -210,3 +210,13 @@ print(f"\nDone. SELECT * FROM {DELTA_TABLE}")
 # MAGIC -- Inspect the inventory written above. Edit the table name if you
 # MAGIC -- changed the DELTA_TABLE constant.
 # MAGIC SELECT * FROM riz_catalog.webhook_rollout.jobs_inventory
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC SELECT workspace_host,count(*) FROM riz_catalog.webhook_rollout.jobs_inventory
+# MAGIC GROUP BY workspace_host
+
+# COMMAND ----------
+
+

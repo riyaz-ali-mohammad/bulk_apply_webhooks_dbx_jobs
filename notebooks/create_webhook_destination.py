@@ -59,7 +59,7 @@ dbutils.widgets.dropdown("apply", "false", ["false", "true"], "actually create (
 
 WORKSPACE_URLS = [
     'https://e2-demo-field-eng.cloud.databricks.com/',
-    'https://e2-demo-west.cloud.databricks.com/'
+    # 'https://e2-demo-west.cloud.databricks.com/'
 ]
 for u in WORKSPACE_URLS:
     print(u)
