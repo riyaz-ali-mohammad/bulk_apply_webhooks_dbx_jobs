@@ -54,7 +54,8 @@ dbutils.widgets.text(
 )
 
 # Operation
-dbutils.widgets.text("webhook_id", "", "webhook destination ID to attach (required)")
+dbutils.widgets.text("webhook_name", "",
+    "webhook destination display_name to attach (required; resolved to id in the current workspace)")
 dbutils.widgets.multiselect(
     "events",
     "on_failure,on_duration_warning_threshold_exceeded",
@@ -81,7 +82,7 @@ dbutils.widgets.text(
 # COMMAND ----------
 
 bundle_dir = dbutils.widgets.get("bundle_dir").strip()
-webhook_id = dbutils.widgets.get("webhook_id").strip()
+webhook_name = dbutils.widgets.get("webhook_name").strip()
 events = dbutils.widgets.get("events").strip()
 apply_flag = dbutils.widgets.get("apply")
 job_raw = dbutils.widgets.get("job").strip()
@@ -90,13 +91,13 @@ owner_raw = dbutils.widgets.get("owner").strip()
 
 # COMMAND ----------
 
-print(f"bundle_dir: {bundle_dir!r}")
-print(f"webhook_id: {webhook_id!r}")
-print(f"events:     {events!r}")
-print(f"apply:      {apply_flag!r}")
-print(f"job:        {job_raw!r}")
-print(f"tag:        {tag!r}")
-print(f"owner:      {owner_raw!r}")
+print(f"bundle_dir:   {bundle_dir!r}")
+print(f"webhook_name: {webhook_name!r}")
+print(f"events:       {events!r}")
+print(f"apply:        {apply_flag!r}")
+print(f"job:          {job_raw!r}")
+print(f"tag:          {tag!r}")
+print(f"owner:        {owner_raw!r}")
 
 # COMMAND ----------
 
@@ -109,19 +110,56 @@ notebook_dir = os.path.dirname(
 )
 repo_root = os.path.abspath(os.path.join("/Workspace" + notebook_dir, ".."))
 
-# Load the top-level script by absolute path via importlib. The regular
-# `import patch_bundle_yaml` after sys.path insertion misbehaves in THIS
-# notebook specifically — empirically it raises ModuleNotFoundError even
-# though the file exists at repo_root + "/patch_bundle_yaml.py". The other
-# four notebooks in this repo don't hit it; the differentiator appears to be
-# this notebook's `dbutils.library.restartPython()` in cell 4 (needed for
-# the ruamel.yaml pip install). Root cause is not fully verified; the
-# importlib bypass sidesteps it entirely by not consulting sys.path.
-script_path = os.path.join(repo_root, "patch_bundle_yaml.py")
-spec = importlib.util.spec_from_file_location("patch_bundle_yaml_script", script_path)
-patch_bundle_yaml = importlib.util.module_from_spec(spec)
-sys.modules["patch_bundle_yaml_script"] = patch_bundle_yaml
-spec.loader.exec_module(patch_bundle_yaml)
+
+def _load_script(name):
+    """Load a top-level script by absolute path via importlib. Bypasses sys.path
+    because the regular import machinery misbehaves in THIS notebook after the
+    `dbutils.library.restartPython()` in cell 4 — empirically it raises
+    ModuleNotFoundError even with the file present and the path inserted into
+    sys.path. Root cause not fully verified; the bypass sidesteps it entirely."""
+    path = os.path.join(repo_root, f"{name}.py")
+    spec = importlib.util.spec_from_file_location(f"{name}_script", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[f"{name}_script"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+patch_bundle_yaml = _load_script("patch_bundle_yaml")
+create_webhook_destination = _load_script("create_webhook_destination")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Resolve `webhook_name` → `webhook_id` in the current workspace
+# MAGIC The patcher writes a literal id into `databricks.yml`, so we need a
+# MAGIC concrete UUID. Page through `/api/2.0/notification-destinations` in the
+# MAGIC workspace this notebook is running in, and match on `display_name`.
+# MAGIC Raises if not found.
+# MAGIC
+# MAGIC Note: this assumes the bundle deploy-target workspace is the same as
+# MAGIC where this notebook runs. If your bundle deploys cross-workspace, the
+# MAGIC literal id written into YAML must also be valid there — verify the
+# MAGIC destination exists with the same `display_name` in every target.
+
+# COMMAND ----------
+
+from databricks.sdk import WorkspaceClient
+
+if not webhook_name:
+    raise SystemExit("webhook_name widget is required.")
+
+_w = WorkspaceClient()
+_dest = create_webhook_destination.find_existing(_w, webhook_name)
+if _dest is None:
+    raise Exception(
+        f"Webhook destination {webhook_name!r} not found in workspace {_w.config.host}. "
+        f"Create it first via notebooks/create_webhook_destination_nb."
+    )
+webhook_id = _dest["id"]
+print(f"Resolved {webhook_name!r} -> {webhook_id} in {_w.config.host}")
+
+# COMMAND ----------
 
 kwargs = dict(
     bundle_dir=bundle_dir,

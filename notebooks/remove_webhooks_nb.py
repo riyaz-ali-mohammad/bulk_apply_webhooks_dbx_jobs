@@ -12,14 +12,15 @@
 # MAGIC per workspace. Per-workspace failures log a WARNING and the loop continues.
 # MAGIC
 # MAGIC ## Modes (selected automatically based on widget values)
-# MAGIC - **Per-job rollback**: set `job_id` and/or `job_ids_from`. `webhook_id`
+# MAGIC - **Per-job rollback**: set `job_id` and/or `job_ids_from`. `webhook_name`
 # MAGIC   optional — omit to clear ALL webhook_notifications from the listed jobs.
 # MAGIC   Filters (`tag`/`owner`) and `bundle_jobs`/`scan_limit`/`limit` are
 # MAGIC   ignored in this mode.
 # MAGIC - **Workspace-walk rollback**: leave `job_id` and `job_ids_from` empty.
-# MAGIC   `webhook_id` REQUIRED. Walks each workspace honoring
+# MAGIC   `webhook_name` REQUIRED. Walks each workspace honoring
 # MAGIC   `tag`/`owner`/`bundle_jobs`/`scan_limit`/`limit` and removes only that
-# MAGIC   destination from every matching job that currently has it.
+# MAGIC   destination from every matching job that currently has it. The name
+# MAGIC   is resolved to the per-workspace id automatically.
 # MAGIC
 # MAGIC ## Bundle-managed jobs
 # MAGIC - **Per-job mode**: the script proceeds and emits a WARNING. API edits
@@ -47,8 +48,8 @@
 dbutils.widgets.text("secret_scope", "webhook-rollout", "Databricks secret scope")
 
 # Operation
-dbutils.widgets.text("webhook_id", "",
-    "webhook destination ID (REQUIRED in walk mode; optional in per-job mode)")
+dbutils.widgets.text("webhook_name", "",
+    "webhook destination display_name (REQUIRED in walk mode; optional in per-job mode — empty clears ALL webhooks)")
 dbutils.widgets.text("job_id", "", "explicit job IDs (comma-separated; per-job mode)")
 dbutils.widgets.text("job_ids_from", "", "path to text/CSV of job IDs (per-job mode)")
 dbutils.widgets.dropdown("apply", "false", ["false", "true"], "actually mutate (vs dry-run)")
@@ -94,7 +95,7 @@ for u in WORKSPACE_URLS:
 # COMMAND ----------
 
 secret_scope = dbutils.widgets.get("secret_scope").strip()
-webhook_id = dbutils.widgets.get("webhook_id").strip()
+webhook_name = dbutils.widgets.get("webhook_name").strip()
 job_id = dbutils.widgets.get("job_id").strip()
 job_ids_from = dbutils.widgets.get("job_ids_from").strip()
 apply_flag = dbutils.widgets.get("apply")
@@ -108,7 +109,7 @@ catalog = dbutils.widgets.get("catalog").strip() or "main"
 # COMMAND ----------
 
 print(f"secret_scope:  {secret_scope!r}")
-print(f"webhook_id:    {webhook_id!r}")
+print(f"webhook_name:  {webhook_name!r}")
 print(f"job_id:        {job_id!r}")
 print(f"job_ids_from:  {job_ids_from!r}")
 print(f"apply:         {apply_flag!r}")
@@ -192,6 +193,7 @@ for p in (repo_root, notebooks_dir):
         sys.path.insert(0, p)
 
 import remove_webhooks
+import create_webhook_destination
 import _auth
 
 
@@ -208,8 +210,55 @@ def _optional_int(s: str):
     return int(s) if s else None
 
 
+clients = _auth.build_clients(
+    workspace_urls=[u.strip().rstrip("/") for u in WORKSPACE_URLS if u and u.strip()],
+    secret_scope=secret_scope or None,
+    client_id_key=SP_CLIENT_ID_KEY,
+    client_secret_key=SP_CLIENT_SECRET_KEY,
+    dbutils=dbutils,
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Resolve `webhook_name` → `webhook_id` per workspace
+# MAGIC When `webhook_name` is set, page each workspace's
+# MAGIC `/api/2.0/notification-destinations` and match on `display_name`. If the
+# MAGIC name isn't present in a target workspace the notebook raises an
+# MAGIC exception listing the missing hosts.
+# MAGIC
+# MAGIC Leaving `webhook_name` empty is allowed **only in per-job mode** — it
+# MAGIC means "clear ALL webhook_notifications from the listed jobs." Walk mode
+# MAGIC requires `webhook_name`; the validation in `remove_webhooks.run` will
+# MAGIC fire if you try to walk without it.
+
+# COMMAND ----------
+
+webhook_ids_by_host = {}
+if webhook_name:
+    missing_hosts = []
+    for w in clients:
+        dest = create_webhook_destination.find_existing(w, webhook_name)
+        if dest is None:
+            missing_hosts.append(w.config.host)
+            print(f"  {w.config.host}: NOT FOUND")
+        else:
+            webhook_ids_by_host[w.config.host] = dest["id"]
+            print(f"  {w.config.host}: {webhook_name!r} -> {dest['id']}")
+
+    if missing_hosts:
+        raise Exception(
+            f"Webhook destination {webhook_name!r} not found in {len(missing_hosts)} "
+            f"workspace(s): {missing_hosts}. Either fix the name, create the "
+            f"destination via notebooks/create_webhook_destination_nb, or leave "
+            f"webhook_name empty to clear ALL webhooks (per-job mode only)."
+        )
+else:
+    print("webhook_name is empty — per-job mode will clear ALL webhooks from listed jobs.")
+
+# COMMAND ----------
+
 shared_kwargs = dict(
-    webhook_id=webhook_id or None,
     job_id=_parse_csv_ints(job_id),
     job_ids_from=job_ids_from or None,
     tag=tag or None,
@@ -229,14 +278,6 @@ shared_kwargs = dict(
     scan_limit=_optional_int(scan_limit),
 )
 
-clients = _auth.build_clients(
-    workspace_urls=[u.strip().rstrip("/") for u in WORKSPACE_URLS if u and u.strip()],
-    secret_scope=secret_scope or None,
-    client_id_key=SP_CLIENT_ID_KEY,
-    client_secret_key=SP_CLIENT_SECRET_KEY,
-    dbutils=dbutils,
-)
-
 apply_label = "APPLY" if shared_kwargs["apply"] else "DRY-RUN"
 mode_label = "PER-JOB" if (shared_kwargs["job_id"] or shared_kwargs["job_ids_from"]) else "WALK"
 print(f"REMOVE ({mode_label}, {apply_label}) across {len(clients)} workspace(s)")
@@ -245,7 +286,12 @@ errors = []
 for w in clients:
     print(f"\n=== {w.config.host} ===")
     try:
-        rc = remove_webhooks.run(client=w, workspace_label=w.config.host, **shared_kwargs)
+        rc = remove_webhooks.run(
+            client=w,
+            workspace_label=w.config.host,
+            webhook_id=webhook_ids_by_host.get(w.config.host),
+            **shared_kwargs,
+        )
         if rc != 0:
             errors.append((w.config.host, f"run returned {rc}"))
     except Exception as e:

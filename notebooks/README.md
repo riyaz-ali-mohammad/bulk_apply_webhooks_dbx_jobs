@@ -258,11 +258,11 @@ To run:
 Inverse of `apply_webhooks_to_direct_jobs`. Two shapes, picked automatically from which
 widgets you fill in:
 
-- **Per-job rollback**: set `job_id` and/or `job_ids_from`. `webhook_id`
+- **Per-job rollback**: set `job_id` and/or `job_ids_from`. `webhook_name`
   optional — omit to clear **all** webhook_notifications from the listed jobs.
   Filters and walk-mode widgets are ignored.
 - **Workspace-walk rollback**: leave `job_id` and `job_ids_from` empty.
-  `webhook_id` **REQUIRED**. Walks each workspace honoring `tag` / `owner` /
+  `webhook_name` **REQUIRED**. Walks each workspace honoring `tag` / `owner` /
   `bundle_jobs` / `scan_limit` / `limit` and removes only that destination
   from every matching job that currently has it.
 
@@ -271,7 +271,7 @@ Widgets:
 | Widget          | Purpose                                                       |
 |-----------------|---------------------------------------------------------------|
 | `secret_scope`  | Secret scope holding the SP credentials                       |
-| `webhook_id`    | Destination ID to detach. REQUIRED in walk mode; optional in per-job mode (omit to clear all). |
+| `webhook_name`  | Destination `display_name` to detach. REQUIRED in walk mode; optional in per-job mode (omit to clear all). Resolved to id per workspace. |
 | `job_id`        | Comma-separated job IDs (per-job mode)                        |
 | `job_ids_from`  | Path to a text/CSV of job IDs (per-job mode). UC Volume path recommended (`/Volumes/<cat>/<schema>/<vol>/file.csv`) — see "Gotchas" |
 | `apply`         | `false` = dry-run. `true` = actually mutate.                  |
@@ -281,8 +281,13 @@ Widgets:
 | `scan_limit`    | Hard cap on jobs scanned — walk mode only                     |
 | `limit`         | Hard cap on jobs mutated — walk mode only                     |
 
+A dedicated cell paginates each workspace's
+`/api/2.0/notification-destinations` and builds a `host -> id` map (skipped
+when `webhook_name` is empty). If the name is missing in any target workspace
+the notebook raises an exception listing the missing hosts.
+
 To run a workspace-wide rollback (most common shape):
-1. Set `webhook_id` and leave `job_id` / `job_ids_from` empty.
+1. Set `webhook_name` and leave `job_id` / `job_ids_from` empty.
 2. Run with `apply=false` first — the dry-run logs which jobs would be
    detached without mutating anything.
 3. Re-run with `apply=true`.
@@ -290,7 +295,7 @@ To run a workspace-wide rollback (most common shape):
 To roll back a specific list of jobs from `jobs_inventory.csv` (or the
 `bundle_jobs.csv` produced by a prior `remove_webhooks` walk-mode run):
 1. Upload the CSV to a UC Volume (e.g. `/Volumes/main/webhook_rollout/csvs/jobs.csv`).
-2. Set `job_ids_from=/Volumes/.../jobs.csv` and (optionally) `webhook_id` to
+2. Set `job_ids_from=/Volumes/.../jobs.csv` and (optionally) `webhook_name` to
    limit the removal to that specific destination.
 3. Dry-run, then apply.
 
@@ -311,14 +316,21 @@ Different from the other four notebooks in two ways:
 
 Widgets:
 
-| Widget        | Purpose                                                       |
-|---------------|---------------------------------------------------------------|
-| `bundle_dir`  | Path to the bundle root (contains `databricks.yml`)           |
-| `webhook_id`  | Destination ID from step 2                                    |
-| `events`      | Comma-separated event list                                    |
-| `job`        | Filter by job `name:` field (comma-separated)                  |
-| `tag`         | Filter by job-resource tag (`key=value` or `key`)              |
-| `apply`       | `false` = dry-run + diff. `true` = write files in place.       |
+| Widget         | Purpose                                                       |
+|----------------|---------------------------------------------------------------|
+| `bundle_dir`   | Path to the bundle root (contains `databricks.yml`)           |
+| `webhook_name` | Destination `display_name` from step 2 (required; resolved to id in the current workspace before the YAML is patched) |
+| `events`       | Multi-select event list                                       |
+| `job`          | Filter by job `name:` field (comma-separated)                 |
+| `tag`          | Filter by job-resource tag (`key=value` or `key`)             |
+| `owner`        | Filter by `permissions:` (comma-separated user/SP/group; IS_OWNER or CAN_MANAGE) |
+| `apply`        | `false` = dry-run + diff. `true` = write files in place.      |
+
+The notebook resolves `webhook_name` to a concrete id via the
+`/api/2.0/notification-destinations` API in the workspace this notebook
+runs in, then writes that literal id into the YAML. If your bundle deploys
+cross-workspace, verify the destination exists with the same `display_name`
+in every target — the literal id written into YAML must be valid there too.
 
 To run:
 1. Bundle owner clones the DAB repo as a Databricks Git folder, e.g.
