@@ -53,9 +53,9 @@ dbutils.widgets.text("secret_scope", "webhook-rollout", "Databricks secret scope
 dbutils.widgets.text("webhook_name", "", "webhook destination display_name (required; resolved to id per workspace)")
 dbutils.widgets.multiselect(
     "events",
-    "on_failure,on_duration_warning_threshold_exceeded",
+    "on_failure",
     ["on_start", "on_success", "on_failure", "on_duration_warning_threshold_exceeded"],
-    "events to attach the webhook on (multi-select)",
+    "events to attach the webhook on (multi-select; default is on_failure only — add on_duration_warning_threshold_exceeded in the UI if desired)",
 )
 dbutils.widgets.dropdown("apply", "false", ["false", "true"], "actually mutate (vs dry-run)")
 
@@ -125,14 +125,14 @@ print(f"limit:         {limit!r}")
 # COMMAND ----------
 
 # Auth mode:
-#   "databricks-oauth" (default) — SP is registered as a Databricks-account
-#       service principal; secret scope holds the *Databricks-issued* OAuth
+#   "azure-direct" (default) — Azure AD direct auth. Secret scope holds the
+#       Azure Application ID, the Azure tenant ID, and the Entra-ID secret.
+#   "databricks-oauth" — SP is registered as a Databricks-account service
+#       principal; secret scope holds the *Databricks-issued* OAuth
 #       client_id / client_secret. SP_TENANT_ID_KEY is unused.
-#   "azure-direct" — Azure AD direct auth. Secret scope holds the Azure
-#       Application ID, the Azure tenant ID, and the Entra-ID secret.
-AUTH_MODE = "databricks-oauth"
-SP_CLIENT_ID_KEY = "databricks_client_id"
-SP_CLIENT_SECRET_KEY = "databricks_client_secret"
+AUTH_MODE = "azure-direct"
+SP_CLIENT_ID_KEY = "azure_client_id"
+SP_CLIENT_SECRET_KEY = "azure_client_secret"
 SP_TENANT_ID_KEY = "azure_tenant_id"  # used only when AUTH_MODE = "azure-direct"
 MAX_RETRIES = 5
 BASE_SLEEP = 0.3

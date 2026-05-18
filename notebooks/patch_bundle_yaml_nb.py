@@ -58,9 +58,9 @@ dbutils.widgets.text("webhook_name", "",
     "webhook destination display_name to attach (required; resolved to id in the current workspace)")
 dbutils.widgets.multiselect(
     "events",
-    "on_failure,on_duration_warning_threshold_exceeded",
+    "on_failure",
     ["on_start", "on_success", "on_failure", "on_duration_warning_threshold_exceeded"],
-    "events to patch (multi-select)",
+    "events to patch (multi-select; default is on_failure only — add on_duration_warning_threshold_exceeded in the UI if desired)",
 )
 dbutils.widgets.dropdown("apply", "false", ["false", "true"], "write files in place (vs dry-run diff)")
 

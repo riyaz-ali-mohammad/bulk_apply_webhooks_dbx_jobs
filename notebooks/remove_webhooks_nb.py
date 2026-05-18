@@ -147,8 +147,14 @@ print(f"DELTA_TABLE: {DELTA_TABLE}")
 
 # COMMAND ----------
 
-SP_CLIENT_ID_KEY = "databricks_client_id"
-SP_CLIENT_SECRET_KEY = "databricks_client_secret"
+# Auth mode (see notebooks/_auth.py for full doc):
+#   "azure-direct" (default) — Azure AD direct auth. Secret scope holds the
+#       Azure Application ID, tenant ID, and Entra-ID secret.
+#   "databricks-oauth" — Databricks-account SP + Databricks-issued OAuth secret.
+AUTH_MODE = "azure-direct"
+SP_CLIENT_ID_KEY = "azure_client_id"
+SP_CLIENT_SECRET_KEY = "azure_client_secret"
+SP_TENANT_ID_KEY = "azure_tenant_id"  # used only when AUTH_MODE = "azure-direct"
 MAX_RETRIES = 5
 BASE_SLEEP = 0.3
 JITTER = 0.4
@@ -164,16 +170,19 @@ PROGRESS_EVERY = 500
 # COMMAND ----------
 
 if WORKSPACE_URLS:
+    required_keys = [SP_CLIENT_ID_KEY, SP_CLIENT_SECRET_KEY]
+    if AUTH_MODE == "azure-direct":
+        required_keys.append(SP_TENANT_ID_KEY)
     present = {k.key for k in dbutils.secrets.list(secret_scope)}
-    for required in (SP_CLIENT_ID_KEY, SP_CLIENT_SECRET_KEY):
+    for required in required_keys:
         if required not in present:
             raise SystemExit(
-                f"Secret scope {secret_scope!r} is missing key {required!r}. "
-                f"Keys present: {sorted(present)}. "
-                f"Edit SP_CLIENT_ID_KEY / SP_CLIENT_SECRET_KEY in this notebook "
-                f"if your scope uses different names."
+                f"Secret scope {secret_scope!r} is missing key {required!r} "
+                f"(AUTH_MODE={AUTH_MODE!r}). Keys present: {sorted(present)}. "
+                f"Edit the SP_*_KEY constants in this notebook if your scope "
+                f"uses different names."
             )
-    print(f"Secret scope {secret_scope!r} OK — keys present: {sorted(present)}")
+    print(f"Secret scope {secret_scope!r} OK ({AUTH_MODE}) — keys present: {sorted(present)}")
 else:
     print("WORKSPACE_URLS empty — skipping secret-scope preflight "
           "(notebook-auto-auth will be used).")
@@ -216,6 +225,8 @@ clients = _auth.build_clients(
     client_id_key=SP_CLIENT_ID_KEY,
     client_secret_key=SP_CLIENT_SECRET_KEY,
     dbutils=dbutils,
+    auth_mode=AUTH_MODE,
+    tenant_id_key=SP_TENANT_ID_KEY,
 )
 
 # COMMAND ----------
