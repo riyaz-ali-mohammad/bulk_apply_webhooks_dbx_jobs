@@ -50,7 +50,7 @@
 dbutils.widgets.text("secret_scope", "webhook-rollout", "Databricks secret scope")
 
 # Operation
-dbutils.widgets.text("webhook_id", "", "webhook destination ID (required)")
+dbutils.widgets.text("webhook_name", "", "webhook destination display_name (required; resolved to id per workspace)")
 dbutils.widgets.multiselect(
     "events",
     "on_failure,on_duration_warning_threshold_exceeded",
@@ -95,7 +95,7 @@ for u in WORKSPACE_URLS:
 # COMMAND ----------
 
 secret_scope = dbutils.widgets.get("secret_scope").strip()
-webhook_id = dbutils.widgets.get("webhook_id").strip()
+webhook_name = dbutils.widgets.get("webhook_name").strip()
 events = dbutils.widgets.get("events").strip()
 apply_flag = dbutils.widgets.get("apply")
 tag = dbutils.widgets.get("tag").strip()
@@ -106,7 +106,7 @@ limit = dbutils.widgets.get("limit").strip()
 # COMMAND ----------
 
 print(f"secret_scope:  {secret_scope!r}")
-print(f"webhook_id:    {webhook_id!r}")
+print(f"webhook_name:  {webhook_name!r}")
 print(f"events:        {events!r}")
 print(f"apply:         {apply_flag!r}")
 print(f"tag:           {tag!r}")
@@ -170,6 +170,7 @@ for p in (repo_root, notebooks_dir):
         sys.path.insert(0, p)
 
 import apply_webhooks_to_direct_jobs
+import create_webhook_destination
 import _auth
 
 
@@ -182,8 +183,50 @@ def _optional_int(s: str):
     return int(s) if s else None
 
 
+clients = _auth.build_clients(
+    workspace_urls=[u.strip().rstrip("/") for u in WORKSPACE_URLS if u and u.strip()],
+    secret_scope=secret_scope or None,
+    client_id_key=SP_CLIENT_ID_KEY,
+    client_secret_key=SP_CLIENT_SECRET_KEY,
+    dbutils=dbutils,
+)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Resolve `webhook_name` → `webhook_id` per workspace
+# MAGIC Notification destination IDs are per-workspace — the same display_name
+# MAGIC has a different UUID in each workspace. Page through the workspace's
+# MAGIC `/api/2.0/notification-destinations` and match on `display_name`. Fail
+# MAGIC fast if any target workspace doesn't contain a destination with this
+# MAGIC name (create it first via `notebooks/create_webhook_destination_nb`).
+
+# COMMAND ----------
+
+if not webhook_name:
+    raise SystemExit("webhook_name widget is required.")
+
+webhook_ids_by_host = {}
+missing_hosts = []
+for w in clients:
+    dest = create_webhook_destination.find_existing(w, webhook_name)
+    if dest is None:
+        missing_hosts.append(w.config.host)
+        print(f"  {w.config.host}: NOT FOUND")
+    else:
+        webhook_ids_by_host[w.config.host] = dest["id"]
+        print(f"  {w.config.host}: {webhook_name!r} -> {dest['id']}")
+
+if missing_hosts:
+    raise Exception(
+        f"Webhook destination {webhook_name!r} not found in {len(missing_hosts)} "
+        f"workspace(s): {missing_hosts}. Create it first via "
+        f"notebooks/create_webhook_destination_nb, then re-run this notebook."
+    )
+
+# COMMAND ----------
+
 shared_kwargs = dict(
-    webhook_id=webhook_id or None,
     events=events,
     tag=tag or None,
     owner=_parse_csv_strs(owner_raw),
@@ -198,14 +241,6 @@ shared_kwargs = dict(
     scan_limit=_optional_int(scan_limit),
 )
 
-clients = _auth.build_clients(
-    workspace_urls=[u.strip().rstrip("/") for u in WORKSPACE_URLS if u and u.strip()],
-    secret_scope=secret_scope or None,
-    client_id_key=SP_CLIENT_ID_KEY,
-    client_secret_key=SP_CLIENT_SECRET_KEY,
-    dbutils=dbutils,
-)
-
 apply_label = "APPLY" if shared_kwargs["apply"] else "DRY-RUN"
 print(f"ADD ({apply_label}) across {len(clients)} workspace(s)")
 
@@ -213,7 +248,12 @@ errors = []
 for w in clients:
     print(f"\n=== {w.config.host} ===")
     try:
-        rc = apply_webhooks_to_direct_jobs.run(client=w, workspace_label=w.config.host, **shared_kwargs)
+        rc = apply_webhooks_to_direct_jobs.run(
+            client=w,
+            workspace_label=w.config.host,
+            webhook_id=webhook_ids_by_host[w.config.host],
+            **shared_kwargs,
+        )
         if rc != 0:
             errors.append((w.config.host, f"run returned {rc}"))
     except Exception as e:

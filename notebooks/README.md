@@ -212,7 +212,9 @@ present in the older SDK shipped on the Databricks runtime. See the comment
 at the top of `../create_webhook_destination.py` for context.
 
 **Outputs**: the destination ID for each workspace, printed to cell output.
-Feed this into the `webhook_id` widget of `apply_webhooks_to_direct_jobs`.
+You don't need to copy this id into the next notebook — `apply_webhooks_to_direct_jobs_nb`
+takes the destination `display_name` and resolves it to the per-workspace id
+itself (see step 3 widgets).
 
 ## 3. `apply_webhooks_to_direct_jobs` — attach (DIRECT jobs only)
 
@@ -228,17 +230,23 @@ Widgets:
 | Widget          | Purpose                                                       |
 |-----------------|---------------------------------------------------------------|
 | `secret_scope`  | Secret scope holding the SP credentials                       |
-| `webhook_id`    | Destination ID from step 2 (required)                         |
-| `events`        | Comma-separated event list. Defaults to `on_failure,on_duration_warning_threshold_exceeded` |
+| `webhook_name`  | Destination `display_name` from step 2 (required; resolved to id per workspace) |
+| `events`        | Multi-select. Defaults to `on_failure,on_duration_warning_threshold_exceeded` |
 | `apply`         | `false` = dry-run. `true` = actually mutate.                  |
 | `tag`           | Tag filter (`key=value` or `key`)                             |
 | `owner`         | Comma-separated creator emails                                |
 | `scan_limit`    | Hard cap on jobs scanned (empty = no cap)                     |
 | `limit`         | Hard cap on jobs **mutated** (different from `scan_limit` — see "gotchas") |
 
+A dedicated cell paginates each workspace's
+`/api/2.0/notification-destinations` and builds a `host -> id` map. If the
+`display_name` isn't present in any target workspace, the notebook raises an
+exception listing the missing workspaces — create the destination there first
+via `notebooks/create_webhook_destination_nb`.
+
 To run:
 1. Edit `WORKSPACE_URLS`.
-2. Set `webhook_id` from step 2.
+2. Set `webhook_name` to the destination's display name from step 2.
 3. Run with `apply=false` first — produces the "would update N jobs" dry-run
    log. Bundle jobs encountered during the walk are logged with
    `SKIP bundle-managed` and counted under `bundle_skipped` in the final
