@@ -226,17 +226,12 @@ def write_inventory(path: str, records: List[JobRecord]) -> None:
     logging.info("Wrote %d job records to %s", len(records), path)
 
 
-def write_inventory_delta(spark, table: str, records: List[JobRecord], workspace_label: str) -> None:
-    """Write records to a Delta table partitioned by workspace_host.
+def _records_to_rows(records: List[JobRecord], workspace_label: str, scanned_at) -> List[Dict]:
+    """Per-job row dicts for Delta write OR in-notebook DataFrame collection.
 
-    Per-workspace re-runs replace only that workspace's partition via dynamic
-    partition overwrite — `SELECT * FROM <table>` always reflects the latest
-    scan per workspace. Multi-workspace loops accumulate across partitions."""
-    if not records:
-        logging.info("No records to write to %s.", table)
-        return
-    import datetime
-    scanned_at = datetime.datetime.now(datetime.timezone.utc)
+    Schema matches `write_inventory_delta` 1:1 — downstream consumers (Delta
+    SELECTs, temp-view SELECTs in the notebook when Delta is toggled off) see
+    identical columns either way."""
     rows = []
     for r in records:
         md = r.metadata or BundleMetadata()
@@ -256,6 +251,21 @@ def write_inventory_delta(spark, table: str, records: List[JobRecord], workspace
             "workspace_file_path": md.workspace_file_path or "",
             "metadata_file_path": r.metadata_file_path or "",
         })
+    return rows
+
+
+def write_inventory_delta(spark, table: str, records: List[JobRecord], workspace_label: str) -> None:
+    """Write records to a Delta table partitioned by workspace_host.
+
+    Per-workspace re-runs replace only that workspace's partition via dynamic
+    partition overwrite — `SELECT * FROM <table>` always reflects the latest
+    scan per workspace. Multi-workspace loops accumulate across partitions."""
+    if not records:
+        logging.info("No records to write to %s.", table)
+        return
+    import datetime
+    scanned_at = datetime.datetime.now(datetime.timezone.utc)
+    rows = _records_to_rows(records, workspace_label, scanned_at)
     df = spark.createDataFrame(rows)
     (df.write
         .format("delta")
@@ -309,12 +319,13 @@ def run(
     scan_limit: Optional[int] = None,
     name_filter: Optional[str] = None,
     workspace_label: Optional[str] = None,
+    collect_rows: Optional[List[Dict]] = None,
 ) -> int:
     """Library entry point. Notebooks import this and map widgets → kwargs.
 
     Kwargs mirror `parse_args()` 1:1 for the CLI shape; notebook-only kwargs
     follow (`client`, `spark`, `delta_table`, `scan_limit`, `name_filter`,
-    `workspace_label`).
+    `workspace_label`, `collect_rows`).
 
     `client`: pre-built WorkspaceClient. When set, `profile` is ignored — used
     by the multi-workspace dispatcher to inject an SP-authed client per target
@@ -328,7 +339,11 @@ def run(
     `name_filter`: forwarded to `w.jobs.list(name=...)` as a server-side
     substring filter on job name. The Jobs API does not support server-side
     filtering on tag or creator, so `name_filter` is the only way to cut the
-    scan size before iteration."""
+    scan size before iteration.
+    `collect_rows`: out-param. When a list is passed, per-job row dicts (same
+    schema as the Delta write) are appended to it. Lets the notebook layer
+    build an in-session Spark DataFrame / temp view when UC catalog write
+    access for a Delta table isn't available."""
     setup_logging(verbose)
 
     w = client if client is not None else build_client(profile)
@@ -393,6 +408,10 @@ def run(
         if spark is None:
             raise SystemExit("delta_table requires a `spark` kwarg (the notebook's SparkSession).")
         write_inventory_delta(spark, delta_table, records, workspace_label or w.config.host)
+    if collect_rows is not None and records:
+        import datetime
+        scanned_at = datetime.datetime.now(datetime.timezone.utc)
+        collect_rows.extend(_records_to_rows(records, workspace_label or w.config.host, scanned_at))
     if output:
         write_inventory(output, records)
     print_summary(stats, top_n, enrich_bundles)

@@ -357,3 +357,59 @@ class TestRunNotebookKwargs:
 
         inv.run(output="", top_n=0, progress_every=0)
         w.jobs.list.assert_called_with(expand_tasks=False)
+
+    def test_collect_rows_appends_per_job_dicts(self, monkeypatch):
+        """When `collect_rows=[]` is passed, run() appends one row dict per
+        matched job. Schema matches write_inventory_delta — this is what the
+        notebook layer uses to build an in-session temp view when the user
+        lacks UC catalog write access for a Delta table."""
+        jobs = [
+            _make_job(job_id=1, name="d1", creator="alice@x.com"),
+            _make_job(job_id=2, name="b1", creator="bob@x.com",
+                      bundle=True, metadata_file_path="/m/b1.json"),
+        ]
+        w = MagicMock()
+        w.jobs.list.return_value = iter(jobs)
+        w.config.host = "https://injected"
+        monkeypatch.setattr(inv, "build_client", lambda profile: w)
+
+        collected = []
+        rc = inv.run(client=w, output="", top_n=0, progress_every=0,
+                     collect_rows=collected)
+        assert rc == 0
+        assert len(collected) == 2
+        # workspace_label defaults to w.config.host when not passed
+        assert all(r["workspace_host"] == "https://injected" for r in collected)
+        kinds = sorted(r["deployment_kind"] for r in collected)
+        assert kinds == ["BUNDLE", "DIRECT"]
+        # schema parity with write_inventory_delta
+        expected_keys = {
+            "workspace_host", "scanned_at", "job_id", "name", "creator",
+            "deployment_kind", "bundle_name", "target",
+            "git_origin", "git_branch", "git_commit",
+            "workspace_root", "workspace_file_path", "metadata_file_path",
+        }
+        assert set(collected[0].keys()) == expected_keys
+
+    def test_collect_rows_uses_explicit_workspace_label(self, monkeypatch):
+        """workspace_label kwarg overrides w.config.host in the row dicts —
+        same semantics as write_inventory_delta."""
+        w = MagicMock()
+        w.jobs.list.return_value = iter([_make_job(job_id=1)])
+        w.config.host = "https://wrong"
+        monkeypatch.setattr(inv, "build_client", lambda profile: w)
+
+        collected = []
+        inv.run(client=w, output="", top_n=0, progress_every=0,
+                workspace_label="https://explicit", collect_rows=collected)
+        assert collected[0]["workspace_host"] == "https://explicit"
+
+    def test_collect_rows_none_is_no_op(self, monkeypatch):
+        """Default `collect_rows=None` must not append anywhere — proves the
+        kwarg is opt-in and CLI users get unchanged behaviour."""
+        w = MagicMock()
+        w.jobs.list.return_value = iter([_make_job(job_id=1)])
+        w.config.host = "https://test"
+        monkeypatch.setattr(inv, "build_client", lambda profile: w)
+        # No raise = no attempt to .extend() a None.
+        assert inv.run(client=w, output="", top_n=0, progress_every=0) == 0

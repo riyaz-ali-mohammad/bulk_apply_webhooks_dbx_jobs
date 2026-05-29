@@ -141,12 +141,28 @@ The notebook layer writes inventory output to a Delta table partitioned by
 (dynamic partition overwrite), so `SELECT * FROM <delta_table>` always reflects
 the latest scan across all workspaces.
 
-- `inventory_jobs` notebook → `delta_table` widget (default `main.webhook_rollout.jobs_inventory`)
+- `inventory_jobs` notebook → `catalog` widget (default `main`; table is `<catalog>.webhook_rollout.jobs_inventory`)
 - `remove_webhooks` notebook → `delta_table` widget (bundle-managed jobs encountered during walk-mode rollback; default `main.webhook_rollout.bundle_jobs`)
 - `apply_webhooks_to_direct_jobs`, `create_webhook_destination`, and `patch_bundle_yaml` notebooks: no Delta output (no inventory to write — the attach script always skips DAB jobs and produces no bundle inventory)
 
 CSV output stays available in the CLI (`--output`, `--bundle-report` for the
 remove script); the notebook layer disables it by default.
+
+#### Running inventory without UC catalog write access
+The `inventory_jobs` notebook has a `write_delta` dropdown. Set it to `false`
+when you (or the SP) don't have `USE CATALOG` / `USE SCHEMA` / `CREATE TABLE`
+on the target catalog. With `write_delta=false`:
+
+- the Delta write is skipped entirely (the `catalog` widget is ignored);
+- per-job rows are accumulated in-memory via the `collect_rows` kwarg on
+  `inventory_jobs.run()` and exposed as a session-scoped Spark temp view
+  named `jobs_inventory_session`;
+- the final `SELECT *` and per-workspace count cells read from that temp view —
+  same schema as the Delta table, so the SQL is unchanged.
+
+The temp view disappears when the cluster restarts or the notebook detaches.
+For a durable inventory you still need Delta — ask a workspace admin for write
+access on a schema you control, then flip `write_delta` back to `true`.
 
 ### Scan performance
 The Databricks Jobs API does not support server-side filtering on tag or creator,
@@ -173,9 +189,14 @@ so tag-filtered walks must iterate the full job list. Two widgets help here:
 5. Open `notebooks/inventory_jobs_nb` first (read-only). Fill widgets:
    - `workspace_urls` = comma-separated target hosts
    - `secret_scope` = `webhook-rollout`
-   - `delta_table` = e.g. `main.webhook_rollout.jobs_inventory`
-6. Run it. `SELECT * FROM main.webhook_rollout.jobs_inventory` should show one
-   row per job across all listed workspaces.
+   - `write_delta` = `true` if you have UC write access; `false` for a
+     session-scoped temp view (`jobs_inventory_session`) instead
+   - `catalog` = e.g. `main` (ignored when `write_delta=false`); the table
+     resolves to `<catalog>.webhook_rollout.jobs_inventory`
+6. Run it. With `write_delta=true`, `SELECT * FROM main.webhook_rollout.jobs_inventory`
+   shows one row per job across all listed workspaces. With `write_delta=false`,
+   the same SELECT works against `jobs_inventory_session` for the duration of
+   the notebook session.
 7. Then `notebooks/create_webhook_destination_nb` to provision the destination in
    each workspace (apply=true once the dry-run looks right).
 8. Then `notebooks/apply_webhooks_to_direct_jobs_nb` to attach the destination

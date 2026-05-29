@@ -53,7 +53,10 @@ dbutils.widgets.dropdown("enrich_bundles", "false", ["false", "true"],
 dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap)")
 
 # Output (Delta inventory)
-dbutils.widgets.text("catalog", "main", "UC catalog for the Delta inventory")
+dbutils.widgets.dropdown("write_delta", "true", ["true", "false"],
+    "write inventory to Delta (set false when you lack UC catalog write access; "
+    "results land in a session-scoped temp view instead)")
+dbutils.widgets.text("catalog", "main", "UC catalog for the Delta inventory (ignored when write_delta=false)")
 
 # COMMAND ----------
 
@@ -87,6 +90,7 @@ tag = dbutils.widgets.get("tag").strip()
 owner_raw = dbutils.widgets.get("owner").strip()
 enrich_bundles = dbutils.widgets.get("enrich_bundles")
 scan_limit = dbutils.widgets.get("scan_limit").strip()
+write_delta = dbutils.widgets.get("write_delta") == "true"
 catalog = dbutils.widgets.get("catalog").strip() or "main"
 
 # COMMAND ----------
@@ -96,20 +100,35 @@ print(f"tag:            {tag!r}")
 print(f"owner:          {owner_raw!r}")
 print(f"enrich_bundles: {enrich_bundles!r}")
 print(f"scan_limit:     {scan_limit!r}")
+print(f"write_delta:    {write_delta!r}")
 print(f"catalog:        {catalog!r}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Output destination
-# MAGIC Schema / table parts are hardcoded; the catalog comes from the `catalog`
-# MAGIC widget. The SP must have `USE CATALOG`, `USE SCHEMA`, and `CREATE TABLE`
-# MAGIC on the target schema.
+# MAGIC When `write_delta=true` the inventory is written to a Delta table — schema
+# MAGIC / table parts are hardcoded; the catalog comes from the `catalog` widget.
+# MAGIC The SP must have `USE CATALOG`, `USE SCHEMA`, and `CREATE TABLE` on the
+# MAGIC target schema.
+# MAGIC
+# MAGIC When `write_delta=false` the Delta write is skipped entirely (no catalog
+# MAGIC needed). Rows are accumulated in-memory and exposed as a session-scoped
+# MAGIC Spark temp view `jobs_inventory_session` — gone when the cluster restarts,
+# MAGIC but usable for the rest of the notebook.
 
 # COMMAND ----------
 
-DELTA_TABLE = f"{catalog}.webhook_rollout.jobs_inventory"
-print(f"DELTA_TABLE: {DELTA_TABLE}")
+if write_delta:
+    DELTA_TABLE = f"{catalog}.webhook_rollout.jobs_inventory"
+    INVENTORY_SOURCE = DELTA_TABLE
+    print(f"DELTA_TABLE:      {DELTA_TABLE}")
+    print(f"INVENTORY_SOURCE: {INVENTORY_SOURCE} (Delta)")
+else:
+    DELTA_TABLE = None
+    INVENTORY_SOURCE = "jobs_inventory_session"
+    print("DELTA_TABLE:      <disabled> (write_delta=false)")
+    print(f"INVENTORY_SOURCE: {INVENTORY_SOURCE} (session-scoped temp view)")
 
 # COMMAND ----------
 
@@ -179,11 +198,13 @@ def _optional_int(s: str):
     return int(s) if s else None
 
 
+collected_rows = [] if not write_delta else None
+
 shared_kwargs = dict(
     profile=None,
     tag=tag or None,
     owner=[o.strip() for o in owner_raw.split(",") if o.strip()] if owner_raw else [],
-    output="",  # CSV disabled in notebook mode; Delta is the output
+    output="",  # CSV disabled in notebook mode; Delta or temp view is the output
     enrich_bundles=enrich_bundles == "true",
     top_n=10,
     progress_every=500,
@@ -191,6 +212,7 @@ shared_kwargs = dict(
     spark=spark,
     delta_table=DELTA_TABLE,
     scan_limit=_optional_int(scan_limit),
+    collect_rows=collected_rows,
 )
 
 clients = _auth.build_clients(
@@ -203,7 +225,7 @@ clients = _auth.build_clients(
     tenant_id_key=SP_TENANT_ID_KEY,
 )
 
-print(f"Inventorying {len(clients)} workspace(s) → {DELTA_TABLE}")
+print(f"Inventorying {len(clients)} workspace(s) → {INVENTORY_SOURCE}")
 errors = []
 for w in clients:
     print(f"\n=== {w.config.host} ===")
@@ -220,16 +242,34 @@ if errors:
     for host, err in errors:
         print(f"  {host}: {err}")
     raise SystemExit(1)
-print(f"\nDone. SELECT * FROM {DELTA_TABLE}")
+
+if not write_delta:
+    if collected_rows:
+        inventory_df = spark.createDataFrame(collected_rows)
+        inventory_df.createOrReplaceTempView(INVENTORY_SOURCE)
+        print(f"\nBuilt in-session DataFrame ({len(collected_rows)} rows); "
+              f"available as temp view {INVENTORY_SOURCE!r}.")
+    else:
+        INVENTORY_SOURCE = None
+        print("\nNo rows collected — nothing to display.")
+
+print(f"\nDone. SELECT * FROM {INVENTORY_SOURCE}" if INVENTORY_SOURCE else "\nDone.")
 
 # COMMAND ----------
 
-# Resolves the table name from DELTA_TABLE so it tracks the catalog widget.
-display(spark.sql(f"SELECT * FROM {DELTA_TABLE}"))
+# Resolves to the Delta table (write_delta=true) or the session temp view
+# (write_delta=false). None when zero rows were collected — display is skipped.
+if INVENTORY_SOURCE:
+    display(spark.sql(f"SELECT * FROM {INVENTORY_SOURCE}"))
+else:
+    print("No inventory rows to display.")
 
 # COMMAND ----------
 
-display(spark.sql(f"SELECT workspace_host, count(*) AS jobs FROM {DELTA_TABLE} GROUP BY workspace_host"))
+if INVENTORY_SOURCE:
+    display(spark.sql(f"SELECT workspace_host, count(*) AS jobs FROM {INVENTORY_SOURCE} GROUP BY workspace_host"))
+else:
+    print("No inventory rows to display.")
 
 # COMMAND ----------
 
