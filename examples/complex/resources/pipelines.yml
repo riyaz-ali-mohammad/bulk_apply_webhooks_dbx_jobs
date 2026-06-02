@@ -1,9 +1,0 @@
-# Delta Live Tables pipeline resource. NOT a job — the patcher must ignore this file.
-resources:
-  pipelines:
-    nightly_dlt:
-      name: nightly-dlt
-      libraries:
-        - notebook:
-            path: ../notebooks/common.py
-      target: dev_catalog.analytics

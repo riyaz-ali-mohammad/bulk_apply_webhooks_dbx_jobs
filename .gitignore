@@ -15,3 +15,9 @@ __pycache__/
 # Runtime artifacts — contain workspace-specific data
 bundle_jobs.csv
 jobs_inventory.csv
+
+# Test scaffolding & reference bundles — kept locally, excluded from the published repo
+tests/
+examples/
+pytest.ini
+requirements-dev.txt

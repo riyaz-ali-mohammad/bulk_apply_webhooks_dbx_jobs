@@ -10,29 +10,26 @@ Five single-file Python CLIs for rolling out a Databricks webhook Notification D
 # Install (prod)
 pip install -r requirements.txt
 
-# Install (dev — includes pytest)
-pip install -r requirements-dev.txt
-
 # Run (mutating scripts default to dry-run; --apply mutates. inventory_jobs.py is
 # read-only by design — no --apply needed.)
 python3 inventory_jobs.py [--enrich-bundles]
 python3 create_webhook_destination.py --url <https-url> --name <display-name>
 python3 apply_webhooks_to_direct_jobs.py --webhook-id <id>
+python3 apply_webhooks_to_direct_jobs.py --webhook-id <id> --job-id 1234 --job-id 5678  # per-job attach
 python3 remove_webhooks.py --webhook-id <id>                # workspace-walk rollback
 python3 remove_webhooks.py --job-id 1234 --job-id 5678      # per-job rollback
 python3 patch_bundle_yaml.py --bundle-dir <path> --webhook-id <id>
-
-# Tests (no workspace required; uses examples/caveats as a tmp_path copy)
-python3 -m pytest                       # full suite
-python3 -m pytest tests/test_apply_webhooks_to_direct_jobs.py
-python3 -m pytest -k TestPatchWebhooksDABCaveats   # single class
 
 # Validate a patched bundle (run from inside the bundle dir)
 databricks bundle validate
 databricks bundle deploy            # or: deploy -t prod
 ```
 
-End-to-end validation against a real workspace is still manual via the `examples/` bundles — see README "Caveats-bundle workflow" and "Full smoke-test workflow" sections.
+The pytest suite (`tests/`), the `examples/` reference bundles, `pytest.ini`, and
+`requirements-dev.txt` are kept **locally** but are gitignored — they are intentionally
+not part of the published repo. They still exist on disk: install dev deps with
+`pip install -r requirements-dev.txt` and run `python3 -m pytest` after changing any of
+the four SDK scripts or the patcher.
 
 ## Project structure
 
@@ -44,32 +41,18 @@ End-to-end validation against a real workspace is still manual via the `examples
 ├── patch_bundle_yaml.py           # Local-checkout-side: round-trip YAML edit of DAB resources.
 ├── create_webhook_destination.py  # One-shot: create a generic-webhook Notification Destination via raw REST (typed API absent in runtime SDK 0.20.0).
 ├── requirements.txt               # Just databricks-sdk and ruamel.yaml.
-├── requirements-dev.txt           # Pulls in requirements.txt + pytest.
-├── pytest.ini                     # testpaths=tests, pythonpath=. so tests can import top-level scripts.
 ├── README.md                      # Long-form user docs; cite section names when changing behavior.
-├── notebooks/                     # Databricks source-format notebooks. All notebook files end in _nb.py to avoid name collisions with the top-level scripts they import (sys.path includes notebooks/, so a notebook named identically to its script would shadow it).
-│   ├── README.md                              # Hands-on runbook for the support team running the notebooks.
-│   ├── _auth.py                               # Shared client-builder used by the four SDK notebooks (multi-workspace via SP OAuth M2M). NOT a notebook — no _nb suffix.
-│   ├── inventory_jobs_nb.py                   # Widgets + multi-workspace loop calling inventory_jobs.run(client=..., delta_table=...).
-│   ├── apply_webhooks_to_direct_jobs_nb.py    # ADD-mode widgets + multi-workspace loop. No bundle_jobs widget, no Delta output.
-│   ├── remove_webhooks_nb.py                  # REMOVE-mode widgets (per-job + walk); auto-picks shape from which widgets are filled.
-│   ├── create_webhook_destination_nb.py       # Same pattern; no Delta output.
-│   └── patch_bundle_yaml_nb.py                # Single-workspace; reads/writes YAMLs in a Databricks Git folder.
-├── tests/
-│   ├── test_inventory_jobs.py         # Classification + filters + CSV schema + end-to-end main() drive + notebook-only kwargs (client/scan_limit/name_filter).
-│   ├── test_apply_webhooks_to_direct_jobs.py  # ADD-path-only: non-DAB attach, always-skip-bundle invariant, run-callable contract.
-│   ├── test_remove_webhooks.py        # REMOVE-path: per-job rollback, walk-mode rollback, load_job_ids_from_file, duplicate-helpers smoke tests.
-│   ├── test_create_webhook_destination.py  # Idempotency + client-injection contract for the multi-workspace dispatcher; mocks api_client.do.
-│   └── test_patch_bundle_yaml.py      # Base-resource patches + DAB caveats; ends with an integration
-│                                      # test that runs main() against a tmp-copy of examples/caveats.
-└── examples/
-    ├── simple/                    # Single-job bundle. Smoke test.
-    ├── complex/                   # Multi-file bundle: variables, include globs, anchors, pipelines.
-    └── caveats/                   # Purpose-built to hit every patcher caveat at once
-                                   #   (${var.*}, <<: *anchor, per-target override).
+└── notebooks/                     # Databricks source-format notebooks. All notebook files end in _nb.py to avoid name collisions with the top-level scripts they import (sys.path includes notebooks/, so a notebook named identically to its script would shadow it).
+    ├── README.md                              # Hands-on runbook for the support team running the notebooks.
+    ├── _auth.py                               # Shared client-builder used by the four SDK notebooks (multi-workspace via SP OAuth M2M). NOT a notebook — no _nb suffix.
+    ├── inventory_jobs_nb.py                   # Widgets + multi-workspace loop calling inventory_jobs.run(client=..., delta_table=...).
+    ├── apply_webhooks_to_direct_jobs_nb.py    # ADD-mode widgets (per-job + walk) + multi-workspace loop. No bundle_jobs widget, no Delta output.
+    ├── remove_webhooks_nb.py                  # REMOVE-mode widgets (per-job + walk); auto-picks shape from which widgets are filled.
+    ├── create_webhook_destination_nb.py       # Same pattern; no Delta output.
+    └── patch_bundle_yaml_nb.py                # Single-workspace; reads/writes YAMLs in a Databricks Git folder.
 ```
 
-`bundle_jobs.csv`, `jobs_inventory.csv`, and `.databricks/` are runtime artifacts — keep them out of source control.
+`tests/`, `examples/`, `pytest.ini`, and `requirements-dev.txt` are kept locally but gitignored (see "Key commands"). `bundle_jobs.csv`, `jobs_inventory.csv`, and `.databricks/` are runtime artifacts — keep them out of source control too.
 
 ## Code conventions
 
@@ -98,21 +81,19 @@ End-to-end validation against a real workspace is still manual via the `examples
 
 ## Testing approach
 
-Two layers:
+The pytest suite and `examples/` reference bundles are kept **locally** (gitignored, not
+in the published repo). They still exist on disk and remain the spec for behavior:
 
-**Pytest suite (`tests/`)** — runs without a workspace.
-- `test_inventory_jobs.py` — `is_bundle_job`, `job_matches`, `fetch_bundle_metadata`, `write_inventory` (CSV schema), plus a `TestMainEndToEnd` class that drives `inventory_jobs.main()` against a mocked `WorkspaceClient`.
-- `test_apply_webhooks_to_direct_jobs.py` — ADD-path coverage. `TestProcessJobNonDAB` for attach logic, `TestIsBundleJob` for the always-skip detection, and `TestBundleJobsAlwaysSkipped` to pin the invariant (bundle jobs go to `stats.bundle_skipped`; `jobs.update` is never called for them; the mutation `--limit` is not consumed by skips). DAB jobs are constructed with a real `JobDeployment(kind=JobDeploymentKind.BUNDLE, …)`.
-- `test_remove_webhooks.py` — REMOVE-path coverage. `TestRemoveWebhooks`, `TestWebhookAttached`, `TestLoadJobIdsFromFile`, `TestProcessRemoveJobDAB`, `TestRemoveWalkMode`, `TestResolveRemoveJobIds`, plus `TestRunCallable` (cross-flag guards) and `TestRunNotebookKwargs` (client + scan_limit) for the run-callable contract. Also smoke-tests the helpers duplicated from `apply_webhooks_to_direct_jobs.py` so drift is caught early.
-- `test_patch_bundle_yaml.py` — split into "base-resource patching" (the non-DAB-style YAML edit case) and "DAB-specific caveats" (`${var.*}` skip, per-target override skip, `_override_dup_events`). The `TestCaveatsBundleEndToEnd` class copies `examples/caveats/` into `tmp_path` and runs `patcher.main()` against the copy — keep that fixture working, the README's caveats workflow is the spec it pins down.
-- Run: `python3 -m pytest`. Single class: `python3 -m pytest -k <ClassName>`.
+- **Pytest suite (`tests/`)** — runs without a workspace. One test module per script,
+  mocking `WorkspaceClient`. Pins the load-bearing invariants: always-skip-bundle (attach
+  path), per-job vs walk dispatch, `${var.*}` / per-target-override skips (patcher), and the
+  `run(**kwargs)` / `client=` contract the notebooks depend on. Run `python3 -m pytest`;
+  single class via `-k <ClassName>`.
+- **End-to-end validation** — manual, against the local `examples/` bundles (`simple`,
+  `complex`, `caveats`). Hand the workspace-deploy commands to the user.
 
-**End-to-end validation against a real workspace** — manual, against the `examples/` bundles:
-- `examples/simple/` — smoke test for the bulk script's bundle detection + the patcher's happy path.
-- `examples/complex/` — multi-file bundle, variables, anchors, pipelines.
-- `examples/caveats/` — every patcher caveat in one bundle; expected log output is documented in the README's "Caveats-bundle workflow" section.
-
-A change to any of the five scripts should pass `pytest` AND be dry-run against the relevant `examples/` bundle before claiming the change works. Hand the workspace-deploy commands to the user — they run anything that touches a Databricks workspace.
+A change to any of the five scripts should pass `pytest` AND be dry-run against the relevant
+`examples/` bundle before claiming the change works.
 
 ## Honesty / anti-hallucination guardrails
 

@@ -764,7 +764,7 @@ Reveals every anchor definition (`&name`) and merge consumer (`<<: *name`). If y
 
 DAB deep-merge **concatenates** `webhook_notifications` event lists at deploy time. The patcher relies on this: it only ever writes to base `resources.jobs.<name>` blocks, and the merge fans the webhook out to every target automatically. There's no flag — overrides are always skipped, and the patcher logs a WARNING in the one case where you'd hit a deploy-rejecting duplicate.
 
-**Starting state** (the `analytics_job` shape from `examples/caveats/`):
+**Starting state** (an illustrative `analytics_job` shape):
 
 ```yaml
 # resources/analytics.yml — base
@@ -792,7 +792,7 @@ targets:
 Run the patcher:
 
 ```bash
-python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID --apply
+python3 patch_bundle_yaml.py --bundle-dir path/to/your/bundle --webhook-id WID --apply
 ```
 
 **Log output**
@@ -1084,74 +1084,3 @@ Creating notification destinations requires workspace-admin. Either run the scri
 **`create_webhook_destination.py` reports "already exists" but you don't see it in the UI**
 The display-name lookup is API-driven and case-sensitive. Check `databricks notification-destinations list` to see exactly what's there; the destination may exist under a slightly different name.
 
----
-
-## Example bundles (reference)
-
-The `examples/` directory contains three reference Asset Bundles you can use to validate both scripts end-to-end:
-
-- **`examples/simple/`** — single-job bundle, single target. Good for the smoke-test workflow below.
-- **`examples/complex/`** — multi-file bundle exercising variables, `include:` globs, YAML anchors/aliases, per-target overrides, and a mix of job and pipeline resources. Useful for stress-testing the patcher.
-- **`examples/caveats/`** — purpose-built to hit every footgun in the "Caveats worth flagging to bundle owners" list in one place: a `${var.webhook_id}` reference, a `<<: *defaults` anchor shared across three jobs, and a per-target override that defines its own `webhook_notifications`. Use this when you want to see exactly how the patcher behaves on each caveat. Walkthrough below.
-
-### Caveats-bundle workflow
-
-```bash
-# 1. Confirm the bundle parses cleanly
-cd examples/caveats && databricks bundle validate && cd ../..
-
-# 2. Deploy a clean baseline to dev (and optionally prod) so you can
-#    compare workspace state before vs after the patcher run.
-cd examples/caveats && databricks bundle deploy && cd ../..
-cd examples/caveats && databricks bundle deploy -t prod && cd ../..   # optional
-
-# 3. Dry-run the patcher. Expected output:
-#    - resources/etl.yml :: extract_job -> patched (anchor target; the
-#      <<: *defaults consumers inherit it via the merge, no per-job duplication).
-#    - resources/analytics.yml :: analytics_job -> patched
-#    - resources/reporting.yml :: WARNING for both default events skipped
-#      (existing ${var.webhook_id} references on on_failure and
-#      on_duration_warning_threshold_exceeded; patcher refuses to mix
-#      literals + variables).
-#    - databricks.yml :: targets.prod.resources.jobs.analytics_job ->
-#      INFO "skipped (target override; DAB merge propagates base patch)".
-python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID-LITERAL-12345
-
-# 4. Apply, then redeploy to both targets. Both succeed — DAB concat
-#    yields [WID, prod-only-pagerduty-uuid] on prod's on_failure, with
-#    no duplicates.
-python3 patch_bundle_yaml.py --bundle-dir examples/caveats --webhook-id WID-LITERAL-12345 --apply
-cd examples/caveats && databricks bundle deploy && cd ../..
-cd examples/caveats && databricks bundle deploy -t prod && cd ../..
-```
-
-Full smoke-test workflow against the simple bundle:
-
-```bash
-# 1. Deploy the example bundle
-cd examples/simple
-databricks bundle validate
-databricks bundle deploy
-cd ../..
-
-# 2. Confirm inventory_jobs classifies the deployed job as BUNDLE.
-#    Look for BUNDLE in jobs_inventory.csv's deployment_kind column.
-python3 inventory_jobs.py --tag webhook-test=simple --enrich-bundles
-
-# 3. Confirm apply_webhooks_to_direct_jobs always skips bundle jobs even
-#    with --apply. Look for `SKIP bundle-managed` and updated=0.
-python3 apply_webhooks_to_direct_jobs.py --webhook-id "$WEBHOOK_ID" \
-    --tag webhook-test=simple --apply
-
-# 4. Patch the YAML via the companion script (dry-run first).
-python3 patch_bundle_yaml.py --bundle-dir examples/simple --webhook-id "$WEBHOOK_ID"
-python3 patch_bundle_yaml.py --bundle-dir examples/simple --webhook-id "$WEBHOOK_ID" --apply
-
-# 5. Redeploy and verify the webhook is now attached durably.
-cd examples/simple && databricks bundle deploy && cd ../..
-
-# 6. From the workspace UI, Run now on the test job and confirm the POST
-#    arrives at your webhook capture endpoint.
-```
-
-Use this as a template for setting up similar end-to-end smoke tests in your own environments.
