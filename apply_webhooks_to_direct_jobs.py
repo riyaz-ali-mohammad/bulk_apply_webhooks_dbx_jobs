@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """Attach a Databricks webhook notification destination to non-DAB jobs in a workspace.
 
-Walks the Jobs API and attaches the supplied webhook to every matching job
-whose `settings.deployment.kind` is NOT `BUNDLE`. DAB-managed (Asset Bundle)
-jobs are **always** skipped — `databricks bundle deploy` would silently
-overwrite API edits, so they belong to the patcher (`patch_bundle_yaml.py`).
-For an inventory of DAB-deployed jobs in a workspace, use `inventory_jobs.py`
-and filter `WHERE deployment_kind = 'BUNDLE'`.
+Two shapes (the script picks based on which flags are passed):
+  (1) Workspace-walk (default): omit --job-id/--job-ids-from. Walks the Jobs API
+      and attaches the supplied webhook to every matching job, honoring
+      --tag/--owner filters.
+  (2) Per-job by ID: pass --job-id / --job-ids-from to attach to explicit job
+      IDs only (looked up directly via jobs.get — no list pagination).
+      Mutually exclusive with the --tag/--owner walk filters.
+
+In BOTH shapes, DAB-managed (Asset Bundle) jobs — `settings.deployment.kind`
+== `BUNDLE` — are **always** skipped, even when a bundle job's ID is passed
+explicitly. `databricks bundle deploy` would silently overwrite API edits, so
+they belong to the patcher (`patch_bundle_yaml.py`). There is no flag to
+override this. For an inventory of DAB-deployed jobs in a workspace, use
+`inventory_jobs.py` and filter `WHERE deployment_kind = 'BUNDLE'`.
 
 For the rollback / detach path, see the companion script `remove_webhooks.py`.
 
@@ -22,12 +30,21 @@ Examples:
   # Apply to jobs tagged team=platform
   python apply_webhooks_to_direct_jobs.py --webhook-id 0123abcd --tag team=platform --apply
 
+  # Attach to specific jobs by ID (repeat --job-id for more than one)
+  python apply_webhooks_to_direct_jobs.py --webhook-id 0123abcd \
+      --job-id 1234 --job-id 5678 --apply
+
+  # Attach to job IDs read from a file (one per line, or first column of a CSV)
+  python apply_webhooks_to_direct_jobs.py --webhook-id 0123abcd \
+      --job-ids-from rollout.txt --apply
+
   # Staged rollout: cap to 25 owner-filtered jobs, then re-run for the rest
   python apply_webhooks_to_direct_jobs.py --webhook-id 0123abcd \
       --owner alice@example.com --owner bob@example.com --limit 25 --apply
 """
 
 import argparse
+import csv
 import logging
 import random
 import sys
@@ -87,14 +104,32 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--job-id",
+        action="append",
+        default=[],
+        type=int,
+        help=(
+            "Job ID to attach the webhook to (per-job mode). Repeatable. "
+            "Mutually exclusive with --tag/--owner filters."
+        ),
+    )
+    p.add_argument(
+        "--job-ids-from",
+        help=(
+            "Path to a text or CSV file containing job IDs, one per line "
+            "(first column if CSV). Header row auto-detected. Combines with --job-id. "
+            "Composes with jobs_inventory.csv via `awk -F, ...`."
+        ),
+    )
+    p.add_argument(
         "--tag",
-        help="Filter by job tag. Format: key=value, or just key for presence-only.",
+        help="Filter by job tag. Format: key=value, or just key for presence-only. Walk mode only.",
     )
     p.add_argument(
         "--owner",
         action="append",
         default=[],
-        help="Filter by creator_user_name. Repeatable for multiple owners.",
+        help="Filter by creator_user_name. Repeatable for multiple owners. Walk mode only.",
     )
     p.add_argument("--apply", action="store_true", help="Actually call jobs/update. Default is dry-run.")
     p.add_argument("--profile", help="Databricks CLI profile name.")
@@ -109,7 +144,15 @@ def parse_args() -> argparse.Namespace:
         help="Log a progress line every N jobs scanned. 0 disables.",
     )
     p.add_argument("-v", "--verbose", action="store_true")
-    return p.parse_args()
+    args = p.parse_args()
+    has_explicit_jobs = bool(args.job_id) or bool(args.job_ids_from)
+    has_filters = bool(args.tag) or bool(args.owner)
+    if has_explicit_jobs and has_filters:
+        p.error(
+            "--tag/--owner filter the workspace walk; they don't combine with "
+            "explicit --job-id/--job-ids-from. Drop the filters, or drop the explicit job list."
+        )
+    return args
 
 
 def setup_logging(verbose: bool) -> None:
@@ -131,6 +174,53 @@ def parse_filters(args: argparse.Namespace) -> Filters:
         else:
             tag_key = args.tag
     return Filters(tag_key=tag_key, tag_value=tag_value, owners=list(args.owner))
+
+
+def load_job_ids_from_file(path: str) -> List[int]:
+    """Read job IDs from a text or CSV file (first column).
+
+    Tolerates: blank lines, surrounding whitespace, BOM on the first cell,
+    and a CSV header row (auto-detected when the first cell isn't an int —
+    so `jobs_inventory.csv` can be piped in directly). Raises SystemExit on
+    empty input or a non-numeric mid-file cell. Duplicated from
+    remove_webhooks.py per the project's no-shared-module convention."""
+    job_ids: List[int] = []
+    first_data_row = True
+    with open(path, newline="", encoding="utf-8-sig") as fh:  # utf-8-sig drops a leading BOM
+        reader = csv.reader(fh)
+        for row in reader:
+            if not row:
+                continue
+            cell = row[0].strip()
+            if not cell:
+                continue
+            try:
+                job_ids.append(int(cell))
+                first_data_row = False
+            except ValueError:
+                if first_data_row:
+                    # Looks like a header row; skip silently.
+                    first_data_row = False
+                    continue
+                raise SystemExit(f"Bad job ID in {path}: {cell!r}")
+    if not job_ids:
+        raise SystemExit(f"No job IDs found in {path}.")
+    return job_ids
+
+
+def _resolve_job_ids(args: argparse.Namespace) -> List[int]:
+    """Merge --job-id and --job-ids-from into a single de-duplicated ordered list."""
+    job_ids: List[int] = list(args.job_id)
+    if args.job_ids_from:
+        job_ids.extend(load_job_ids_from_file(args.job_ids_from))
+    # Preserve order, drop duplicates.
+    seen = set()
+    deduped: List[int] = []
+    for jid in job_ids:
+        if jid not in seen:
+            seen.add(jid)
+            deduped.append(jid)
+    return deduped
 
 
 def parse_events(s: str) -> List[str]:
@@ -262,75 +352,107 @@ def process_job(
         logging.error("Job %s (%s): update failed: %s", job.job_id, name, e)
 
 
+def process_job_by_id(
+    w: WorkspaceClient,
+    job_id: int,
+    webhook_id: str,
+    events: List[str],
+    apply: bool,
+    max_retries: int,
+    stats: Stats,
+) -> None:
+    """Per-job-id attach: look the job up, then delegate to `process_job`.
+
+    Bundle-managed jobs are STILL skipped here even though the user pointed at
+    them explicitly — the always-skip invariant has no escape hatch (API edits
+    to bundle jobs are non-durable across `databricks bundle deploy`; use
+    patch_bundle_yaml.py instead). This differs from remove_webhooks.py, where
+    per-job mode proceeds on bundle jobs with a WARNING."""
+    try:
+        job = call_with_backoff(lambda: w.jobs.get(job_id=job_id), max_retries=max_retries)
+    except Exception as e:
+        stats.errored += 1
+        logging.error("Job %s: lookup failed: %s", job_id, e)
+        return
+
+    name = (job.settings.name if job.settings else None) or "<unnamed>"
+    stats.matched += 1
+
+    bundle, _meta_path = is_bundle_job(job)
+    if bundle:
+        stats.bundle_skipped += 1
+        logging.info(
+            "Job %s (%s): SKIP bundle-managed (use patch_bundle_yaml for DAB jobs).",
+            job_id, name,
+        )
+        return
+
+    process_job(w, job, webhook_id, events, apply, max_retries, stats)
+
+
 def _validate_run_kwargs(args: argparse.Namespace) -> None:
     """Re-implement the CLI's post-parse validation so that notebook callers
     fail the same way the CLI does. argparse's required=True on --webhook-id
-    is the source of truth at [parse_args()] — keep in sync."""
+    and the cross-flag check are the source of truth at [parse_args()] — keep
+    in sync."""
     if not args.webhook_id:
         raise SystemExit("webhook_id is required.")
+    has_explicit_jobs = bool(args.job_id) or bool(args.job_ids_from)
+    has_filters = bool(args.tag) or bool(args.owner)
+    if has_explicit_jobs and has_filters:
+        raise SystemExit(
+            "--tag/--owner filter the workspace walk; they don't combine with "
+            "explicit --job-id/--job-ids-from. Drop the filters, or drop the explicit job list."
+        )
 
 
-def run(
-    webhook_id: Optional[str] = None,
-    events: str = "on_failure,on_duration_warning_threshold_exceeded",
-    tag: Optional[str] = None,
-    owner: Optional[List[str]] = None,
-    apply: bool = False,
-    profile: Optional[str] = None,
-    max_retries: int = 5,
-    base_sleep: float = 0.3,
-    jitter: float = 0.4,
-    limit: Optional[int] = None,
-    progress_every: int = 500,
-    verbose: bool = False,
-    client=None,
-    scan_limit: Optional[int] = None,
-    name_filter: Optional[str] = None,
-    workspace_label: Optional[str] = None,
+def run_by_id_mode(
+    args: argparse.Namespace,
+    w: WorkspaceClient,
+    parsed_events: List[str],
+    stats: Stats,
 ) -> int:
-    """Library entry point. Notebooks import this and map widgets → kwargs.
+    """Per-job-id attach path. Explicit job IDs, no workspace listing, no filters.
 
-    Kwargs mirror `parse_args()` 1:1 for the CLI shape; notebook-only kwargs
-    follow (`client`, `scan_limit`, `name_filter`, `workspace_label`).
-
-    `limit` (mutation cap) and `scan_limit` (scan cap) are distinct: `limit`
-    stops the loop once N jobs would-update / updated; `scan_limit` stops the
-    walk after N jobs scanned regardless of matches. When matches are sparse,
-    `limit` alone won't shorten the scan — set `scan_limit` for that.
-
-    DAB-managed jobs are always skipped (counted in `stats.bundle_skipped`).
-    There is no `--bundle-jobs` flag — that escape hatch was removed because
-    API edits to bundle jobs are non-durable across `databricks bundle deploy`.
-    Use `patch_bundle_yaml.py` for the bundle path."""
-    args = argparse.Namespace(
-        webhook_id=webhook_id,
-        events=events,
-        tag=tag,
-        owner=list(owner or []),
-        apply=apply,
-        profile=profile,
-        max_retries=max_retries,
-        base_sleep=base_sleep,
-        jitter=jitter,
-        limit=limit,
-        progress_every=progress_every,
-        verbose=verbose,
-        scan_limit=scan_limit,
-        name_filter=name_filter,
-        workspace_label=workspace_label,
+    `scan_limit`/`name_filter` don't apply here (there's no walk to cap). `limit`
+    still caps mutations so a long --job-ids-from list can be staged."""
+    job_ids = _resolve_job_ids(args)
+    logging.info(
+        "Mode=%s op=ADD-BY-ID webhook=%s events=%s job_count=%d",
+        "APPLY" if args.apply else "DRY-RUN",
+        args.webhook_id, parsed_events, len(job_ids),
     )
-    _validate_run_kwargs(args)
-    setup_logging(args.verbose)
+    for job_id in job_ids:
+        stats.scanned += 1
+        process_job_by_id(w, job_id, args.webhook_id, parsed_events, args.apply, args.max_retries, stats)
 
-    w = client if client is not None else build_client(args.profile)
-    args.workspace_label = args.workspace_label or w.config.host
-    stats = Stats()
+        if args.apply:
+            time.sleep(args.base_sleep + random.uniform(0, args.jitter))
 
-    parsed_events = parse_events(args.events)
+        if args.limit is not None and (stats.updated + stats.would_update) >= args.limit:
+            logging.info("Reached --limit=%d, stopping.", args.limit)
+            break
+
+    logging.info(
+        "Done. op=ADD-BY-ID scanned=%d matched=%d already_attached=%d bundle_skipped=%d "
+        "would_update=%d updated=%d errored=%d",
+        stats.scanned, stats.matched, stats.already_attached, stats.bundle_skipped,
+        stats.would_update, stats.updated, stats.errored,
+    )
+    return 1 if stats.errored else 0
+
+
+def run_walk_mode(
+    args: argparse.Namespace,
+    w: WorkspaceClient,
+    parsed_events: List[str],
+    stats: Stats,
+) -> int:
+    """Workspace-walk attach path: list -> filter -> bundle skip -> attach."""
     filters = parse_filters(args)
 
     logging.info(
-        "Mode=%s webhook=%s events=%s tag=%s owners=%s limit=%s scan_limit=%s name_filter=%s",
+        "Mode=%s op=ADD-WALK webhook=%s events=%s tag=%s owners=%s limit=%s scan_limit=%s name_filter=%s",
         "APPLY" if args.apply else "DRY-RUN",
         args.webhook_id, parsed_events,
         f"{filters.tag_key}={filters.tag_value}" if filters.tag_key else None,
@@ -378,11 +500,85 @@ def run(
             break
 
     logging.info(
-        "Done. scanned=%d matched=%d already_attached=%d bundle_skipped=%d would_update=%d updated=%d errored=%d",
+        "Done. op=ADD-WALK scanned=%d matched=%d already_attached=%d bundle_skipped=%d would_update=%d updated=%d errored=%d",
         stats.scanned, stats.matched, stats.already_attached, stats.bundle_skipped,
         stats.would_update, stats.updated, stats.errored,
     )
     return 1 if stats.errored else 0
+
+
+def run(
+    webhook_id: Optional[str] = None,
+    events: str = "on_failure,on_duration_warning_threshold_exceeded",
+    job_id: Optional[List[int]] = None,
+    job_ids_from: Optional[str] = None,
+    tag: Optional[str] = None,
+    owner: Optional[List[str]] = None,
+    apply: bool = False,
+    profile: Optional[str] = None,
+    max_retries: int = 5,
+    base_sleep: float = 0.3,
+    jitter: float = 0.4,
+    limit: Optional[int] = None,
+    progress_every: int = 500,
+    verbose: bool = False,
+    client=None,
+    scan_limit: Optional[int] = None,
+    name_filter: Optional[str] = None,
+    workspace_label: Optional[str] = None,
+) -> int:
+    """Library entry point. Notebooks import this and map widgets → kwargs.
+
+    Kwargs mirror `parse_args()` 1:1 for the CLI shape; notebook-only kwargs
+    follow (`client`, `scan_limit`, `name_filter`, `workspace_label`).
+
+    Two shapes, picked by whether `job_id`/`job_ids_from` is set:
+    per-job-id attach (explicit IDs, no walk, no filters) vs workspace-walk
+    attach. `job_id`/`job_ids_from` are mutually exclusive with `tag`/`owner`.
+
+    `limit` (mutation cap) and `scan_limit` (scan cap) are distinct: `limit`
+    stops the loop once N jobs would-update / updated; `scan_limit` stops the
+    walk after N jobs scanned regardless of matches. When matches are sparse,
+    `limit` alone won't shorten the scan — set `scan_limit` for that.
+    (`scan_limit`/`name_filter` are walk-mode only — there's no walk to cap in
+    per-job-id mode.)
+
+    DAB-managed jobs are always skipped (counted in `stats.bundle_skipped`),
+    in BOTH shapes — even an explicitly-passed bundle job ID is skipped. There
+    is no `--bundle-jobs` flag — that escape hatch was removed because API edits
+    to bundle jobs are non-durable across `databricks bundle deploy`. Use
+    `patch_bundle_yaml.py` for the bundle path."""
+    args = argparse.Namespace(
+        webhook_id=webhook_id,
+        events=events,
+        job_id=list(job_id or []),
+        job_ids_from=job_ids_from,
+        tag=tag,
+        owner=list(owner or []),
+        apply=apply,
+        profile=profile,
+        max_retries=max_retries,
+        base_sleep=base_sleep,
+        jitter=jitter,
+        limit=limit,
+        progress_every=progress_every,
+        verbose=verbose,
+        scan_limit=scan_limit,
+        name_filter=name_filter,
+        workspace_label=workspace_label,
+    )
+    _validate_run_kwargs(args)
+    setup_logging(args.verbose)
+
+    w = client if client is not None else build_client(args.profile)
+    args.workspace_label = args.workspace_label or w.config.host
+    stats = Stats()
+
+    parsed_events = parse_events(args.events)
+
+    if args.job_id or args.job_ids_from:
+        return run_by_id_mode(args, w, parsed_events, stats)
+    return run_walk_mode(args, w, parsed_events, stats)
 
 
 def main() -> int:

@@ -39,9 +39,20 @@ Read-only discovery step. Use this when you've been pointed at a new workspace a
 ## What `apply_webhooks_to_direct_jobs.py` does
 
 Bulk-attach path (the rollback / detach path lives in
-[`remove_webhooks.py`](#what-remove_webhookspy-does)).
+[`remove_webhooks.py`](#what-remove_webhookspy-does)). Two shapes, picked by
+which flags you pass:
 
-- Enumerates jobs via `GET /api/2.2/jobs/list` (paginated).
+- **Workspace-walk** (default) — omit `--job-id`/`--job-ids-from`. Walks
+  `jobs/list` honoring `--tag` / `--owner`.
+- **Per-job by ID** — `--job-id` (repeatable) and/or `--job-ids-from <path>`
+  (text/CSV). Looks up each job directly via `jobs.get`, no list pagination.
+  Mutually exclusive with the `--tag` / `--owner` walk filters.
+
+In both shapes, DAB-managed jobs are **always skipped** (see below) — even a
+bundle job ID passed explicitly to `--job-id` is skipped, not mutated.
+
+- Enumerates jobs via `GET /api/2.2/jobs/list` (paginated) in walk mode, or
+  `GET /api/2.2/jobs/get` per ID in per-job mode.
 - For each job, computes the desired `webhook_notifications` block by merging the supplied webhook ID into the configured event lists (defaults: `on_failure`, `on_duration_warning_threshold_exceeded` — chosen to stay low-noise across many workspaces; pass `--events on_failure,on_success,on_start` if you also want lifecycle events). Existing webhooks are preserved.
 - Calls `POST /api/2.2/jobs/update` to apply the change.
 - **Always skips** DAB-managed jobs (`settings.deployment.kind == BUNDLE`). There is no flag to override — API edits to bundle jobs are non-durable across `databricks bundle deploy`. Use `patch_bundle_yaml.py` for the bundle path. To find DAB jobs in a workspace, use `inventory_jobs.py` and filter `WHERE deployment_kind = 'BUNDLE'`.
@@ -957,12 +968,20 @@ If the script couldn't read a bundle's metadata (e.g. ACL on the workspace path)
                            (chosen to stay low-noise; add on_start/on_success
                            explicitly if you also want lifecycle events).
 
---tag key=value | key      Filter to jobs whose tags contain key=value
-                           (or just key for presence-only).
---owner <email>            Filter by creator_user_name. Repeatable.
+--job-id <id>              Attach to this job ID (per-job mode). Repeatable.
+                           Mutually exclusive with --tag/--owner.
+--job-ids-from <path>      Path to a text or CSV file with job IDs (first
+                           column). Header row auto-detected. Combines with
+                           --job-id (de-duplicated).
 
-# DAB-managed jobs (settings.deployment.kind == BUNDLE) are always skipped.
-# There is no --bundle-jobs flag; use patch_bundle_yaml.py for those.
+--tag key=value | key      Filter to jobs whose tags contain key=value
+                           (or just key for presence-only). Walk mode only.
+--owner <email>            Filter by creator_user_name. Repeatable.
+                           Walk mode only.
+
+# DAB-managed jobs (settings.deployment.kind == BUNDLE) are always skipped, in
+# BOTH modes — even a bundle job ID passed to --job-id is skipped. There is no
+# --bundle-jobs flag; use patch_bundle_yaml.py for those.
 
 --apply                    Actually call jobs/update. Default is dry-run.
 --limit <N>                Stop after N updates (matched + would_update).

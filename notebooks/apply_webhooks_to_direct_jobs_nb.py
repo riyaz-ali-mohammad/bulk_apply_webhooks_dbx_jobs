@@ -2,13 +2,23 @@
 # MAGIC %md
 # MAGIC # Attach a Webhook Notification Destination to Direct (non-DAB) Jobs
 # MAGIC
-# MAGIC Walks the Jobs API across one or more target workspaces and attaches a
-# MAGIC webhook destination on every matching **non-DAB** job. Default is
-# MAGIC **dry-run** — flip `apply=true` to actually mutate.
+# MAGIC Attaches a webhook destination on matching **non-DAB** jobs across one or
+# MAGIC more target workspaces. Default is **dry-run** — flip `apply=true` to
+# MAGIC actually mutate.
 # MAGIC
-# MAGIC DAB-managed (Asset Bundle) jobs are **always skipped** — there is no
-# MAGIC widget to override this. `databricks bundle deploy` would silently
-# MAGIC overwrite API edits, so they belong to the patcher notebook
+# MAGIC ## Modes (selected automatically based on widget values)
+# MAGIC - **Workspace-walk** (default): leave `job_id` and `job_ids_from` empty.
+# MAGIC   Walks each workspace's `jobs/list` honoring the `tag`/`owner`/
+# MAGIC   `scan_limit`/`limit` widgets.
+# MAGIC - **Per-job by ID**: set `job_id` (comma-separated IDs) and/or
+# MAGIC   `job_ids_from` (path to a text/CSV of IDs). Looks up each job directly
+# MAGIC   via `jobs.get` — no list pagination. The `tag`/`owner` filters are
+# MAGIC   ignored in this mode (and rejected if combined).
+# MAGIC
+# MAGIC DAB-managed (Asset Bundle) jobs are **always skipped** in BOTH modes —
+# MAGIC there is no widget to override this, and even an explicitly-listed bundle
+# MAGIC job ID is skipped. `databricks bundle deploy` would silently overwrite
+# MAGIC API edits, so they belong to the patcher notebook
 # MAGIC (`notebooks/patch_bundle_yaml`). For an inventory of DAB jobs in a
 # MAGIC workspace, run `notebooks/inventory_jobs` and filter
 # MAGIC `WHERE deployment_kind = 'BUNDLE'`.
@@ -59,9 +69,13 @@ dbutils.widgets.multiselect(
 )
 dbutils.widgets.dropdown("apply", "false", ["false", "true"], "actually mutate (vs dry-run)")
 
-# Filters
-dbutils.widgets.text("tag", "", "tag filter (key=value or key)")
-dbutils.widgets.text("owner", "", "owner filter (comma-separated emails)")
+# Targeting (per-job mode — leave empty for workspace-walk mode)
+dbutils.widgets.text("job_id", "", "explicit job IDs (comma-separated; per-job mode)")
+dbutils.widgets.text("job_ids_from", "", "path to text/CSV of job IDs (per-job mode)")
+
+# Filters (walk mode only)
+dbutils.widgets.text("tag", "", "tag filter (key=value or key) — walk mode only")
+dbutils.widgets.text("owner", "", "owner filter (comma-separated emails) — walk mode only")
 
 # Performance
 dbutils.widgets.text("scan_limit", "", "hard cap on jobs scanned (empty = no cap)")
@@ -98,6 +112,8 @@ secret_scope = dbutils.widgets.get("secret_scope").strip()
 webhook_name = dbutils.widgets.get("webhook_name").strip()
 events = dbutils.widgets.get("events").strip()
 apply_flag = dbutils.widgets.get("apply")
+job_id = dbutils.widgets.get("job_id").strip()
+job_ids_from = dbutils.widgets.get("job_ids_from").strip()
 tag = dbutils.widgets.get("tag").strip()
 owner_raw = dbutils.widgets.get("owner").strip()
 scan_limit = dbutils.widgets.get("scan_limit").strip()
@@ -109,6 +125,8 @@ print(f"secret_scope:  {secret_scope!r}")
 print(f"webhook_name:  {webhook_name!r}")
 print(f"events:        {events!r}")
 print(f"apply:         {apply_flag!r}")
+print(f"job_id:        {job_id!r}")
+print(f"job_ids_from:  {job_ids_from!r}")
 print(f"tag:           {tag!r}")
 print(f"owner:         {owner_raw!r}")
 print(f"scan_limit:    {scan_limit!r}")
@@ -185,6 +203,10 @@ import create_webhook_destination
 import _auth
 
 
+def _parse_csv_ints(s: str):
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+
 def _parse_csv_strs(s: str):
     return [x.strip() for x in s.split(",") if x.strip()]
 
@@ -241,6 +263,8 @@ if missing_hosts:
 
 shared_kwargs = dict(
     events=events,
+    job_id=_parse_csv_ints(job_id),
+    job_ids_from=job_ids_from or None,
     tag=tag or None,
     owner=_parse_csv_strs(owner_raw),
     apply=apply_flag == "true",
@@ -255,7 +279,8 @@ shared_kwargs = dict(
 )
 
 apply_label = "APPLY" if shared_kwargs["apply"] else "DRY-RUN"
-print(f"ADD ({apply_label}) across {len(clients)} workspace(s)")
+mode_label = "PER-JOB" if (shared_kwargs["job_id"] or shared_kwargs["job_ids_from"]) else "WALK"
+print(f"ADD ({mode_label}, {apply_label}) across {len(clients)} workspace(s)")
 
 errors = []
 for w in clients:
